@@ -1,0 +1,275 @@
+//@version=6
+strategy("ADX Regime ATR Execution Engine v2.1",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=0.1,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05,
+     slippage=2,
+     calc_on_every_tick=true,
+     calc_on_every_history_tick=true,
+     calc_on_order_fills=true,
+     process_orders_on_close=false,
+     use_bar_magnifier=true)
+
+// =============================================================================
+// PROFILE — matches the active TradingView settings supplied with this project.
+// EMA 20/50, ADX 22/18, Trend RR 4, Range RR 2.5, 5-stage ATR trail.
+// =============================================================================
+emaTrendLen = input.int(50,  "EMA Trend Length", minval=20, maxval=500)
+emaFastLen  = input.int(20,  "EMA Fast Length",  minval=5,  maxval=200)
+atrLen      = input.int(14,  "ATR Length",       minval=5,  maxval=50)
+diLen       = input.int(14,  "DI Length",        minval=5,  maxval=50)
+adxSmooth   = input.int(14,  "ADX Smoothing",   minval=5,  maxval=50)
+adxEMA      = input.int(5,   "ADX EMA",         minval=1,  maxval=20)
+rsiLen      = input.int(14,  "RSI Length",       minval=5,  maxval=50)
+
+adxTrendTh   = input.float(22.0, "ADX Trend Threshold", minval=1, maxval=60, step=0.5)
+adxRangeTh   = input.float(18.0, "ADX Range Threshold", minval=1, maxval=60, step=0.5)
+filterATRmul = input.float(1.4,  "Filter ATR Mult",     minval=0.1, maxval=5, step=0.1)
+filterBody   = input.float(0.5,  "Filter Body (ATR)",   minval=0.1, maxval=3, step=0.1)
+
+trendRR     = input.float(4.0, "Trend RR",           minval=0.5, maxval=20, step=0.1)
+rangeRR     = input.float(2.5, "Range RR",           minval=0.5, maxval=20, step=0.1)
+trendATRmul = input.float(0.6, "Trend ATR SL Mult",  minval=0.1, maxval=5, step=0.1)
+rangeATRmul = input.float(0.5, "Range ATR SL Mult",  minval=0.1, maxval=5, step=0.1)
+
+trail1Trigger = input.float(0.8,  "Stage 1 Trigger (ATR)", minval=0.1, maxval=20, step=0.1)
+trail1Pts     = input.float(0.5,  "Stage 1 Trail Pts (ATR)", minval=0.05, maxval=5, step=0.05)
+trail1Off     = input.float(0.4,  "Stage 1 Trail Off (ATR)", minval=0.05, maxval=5, step=0.05)
+trail2Trigger = input.float(1.5,  "Stage 2 Trigger (ATR)", minval=0.1, maxval=20, step=0.1)
+trail2Pts     = input.float(0.4,  "Stage 2 Trail Pts (ATR)", minval=0.05, maxval=5, step=0.05)
+trail2Off     = input.float(0.3,  "Stage 2 Trail Off (ATR)", minval=0.05, maxval=5, step=0.05)
+trail3Trigger = input.float(2.5,  "Stage 3 Trigger (ATR)", minval=0.1, maxval=20, step=0.1)
+trail3Pts     = input.float(0.3,  "Stage 3 Trail Pts (ATR)", minval=0.05, maxval=5, step=0.05)
+trail3Off     = input.float(0.25, "Stage 3 Trail Off (ATR)", minval=0.05, maxval=5, step=0.05)
+trail4Trigger = input.float(4.0,  "Stage 4 Trigger (ATR)", minval=0.1, maxval=20, step=0.1)
+trail4Pts     = input.float(0.2,  "Stage 4 Trail Pts (ATR)", minval=0.05, maxval=5, step=0.05)
+trail4Off     = input.float(0.15, "Stage 4 Trail Off (ATR)", minval=0.05, maxval=5, step=0.05)
+trail5Trigger = input.float(6.0,  "Stage 5 Trigger (ATR)", minval=0.1, maxval=20, step=0.1)
+trail5Pts     = input.float(0.15, "Stage 5 Trail Pts (ATR)", minval=0.05, maxval=5, step=0.05)
+trail5Off     = input.float(0.10, "Stage 5 Trail Off (ATR)", minval=0.05, maxval=5, step=0.05)
+
+beMult      = input.float(0.6,   "Breakeven ATR Mult",   minval=0.1, maxval=5, step=0.1)
+maxSLmult   = input.float(1.5,   "Dynamic Max SL (ATR)", minval=0.5, maxval=10, step=0.1)
+maxSLPoints = input.float(500.0, "Hard Max SL (Points)", minval=10, maxval=5000, step=10)
+rsiOB       = input.int(70,      "RSI Overbought",       minval=50, maxval=95)
+rsiOS       = input.int(30,      "RSI Oversold",         minval=5,  maxval=50)
+showState   = input.bool(true,    "Show execution state table")
+
+// =============================================================================
+// INDICATORS + ENTRY FILTERS
+// =============================================================================
+emaTrend = ta.ema(close, emaTrendLen)
+emaFast  = ta.ema(close, emaFastLen)
+atr      = ta.atr(atrLen)
+rsi      = ta.rsi(close, rsiLen)
+[dip, dim, adxRaw] = ta.dmi(diLen, adxSmooth)
+adx = ta.ema(adxRaw, adxEMA)
+
+trendRegime = adx > adxTrendTh
+rangeRegime = adx < adxRangeTh
+filters = atr < ta.sma(atr, 50) * filterATRmul and volume > ta.sma(volume, 20) and math.abs(close - open) > atr * filterBody
+
+trendLong  = trendRegime and emaFast > emaTrend and dip > dim and close > high[1] and filters
+trendShort = trendRegime and emaFast < emaTrend and dim > dip and close < low[1] and filters
+rangeLong  = rangeRegime and rsi < rsiOS and filters
+rangeShort = rangeRegime and rsi > rsiOB and filters
+
+// =============================================================================
+// STATE
+// varip is required because realtime strategies roll ordinary variables back on
+// each intrabar execution. Entry ATR is frozen so stop, TP, BE and stage thresholds
+// do not drift as ATR changes later in the trade.
+// =============================================================================
+varip float pendingATR       = na
+varip bool  pendingIsTrend   = false
+varip string pendingEntryId  = ""
+
+varip float entryPrice       = na
+varip float entryATR         = na
+varip bool  entryIsTrend     = false
+varip float initialSL        = na
+varip float takeProfit       = na
+varip float effectiveStop    = na
+varip bool  beDone           = false
+varip int   trailStage       = 0
+varip bool  trailArmed       = false
+varip float bestPrice        = na
+varip float trailStop        = na
+varip float prevPosSize      = 0.0
+varip int   lastExitBar      = na
+varip int   lastLabeledStage = 0
+
+stagePts(int stage) =>
+    stage == 5 ? trail5Pts : stage == 4 ? trail4Pts : stage == 3 ? trail3Pts : stage == 2 ? trail2Pts : trail1Pts
+
+stageOff(int stage) =>
+    stage == 5 ? trail5Off : stage == 4 ? trail4Off : stage == 3 ? trail3Off : stage == 2 ? trail2Off : trail1Off
+
+stageColor(int stage) =>
+    stage == 5 ? color.fuchsia : stage == 4 ? color.red : stage == 3 ? color.orange : stage == 2 ? color.yellow : stage == 1 ? color.lime : color.gray
+
+newPosition = strategy.position_size != 0 and prevPosSize == 0
+justClosed  = strategy.position_size == 0 and prevPosSize != 0
+
+if justClosed
+    lastExitBar      := bar_index
+    entryPrice       := na
+    entryATR         := na
+    entryIsTrend     := false
+    initialSL        := na
+    takeProfit       := na
+    effectiveStop    := na
+    beDone           := false
+    trailStage       := 0
+    trailArmed       := false
+    bestPrice        := na
+    trailStop        := na
+    lastLabeledStage := 0
+
+// Entries are decided only from a confirmed candle. process_orders_on_close=false
+// preserves the realistic one-tick delay: the market order fills on the next
+// available tick. The same-bar re-entry guard prevents calc_on_order_fills from
+// creating a historical exit/re-entry loop after an intrabar fill.
+canEnter = barstate.isconfirmed and strategy.position_size == 0 and (na(lastExitBar) or bar_index != lastExitBar)
+
+if canEnter
+    if trendLong
+        pendingATR      := atr
+        pendingIsTrend  := true
+        pendingEntryId  := "Trend Long"
+        strategy.entry("Trend Long", strategy.long)
+    else if trendShort
+        pendingATR      := atr
+        pendingIsTrend  := true
+        pendingEntryId  := "Trend Short"
+        strategy.entry("Trend Short", strategy.short)
+    else if rangeLong
+        pendingATR      := atr
+        pendingIsTrend  := false
+        pendingEntryId  := "Range Long"
+        strategy.entry("Range Long", strategy.long)
+    else if rangeShort
+        pendingATR      := atr
+        pendingIsTrend  := false
+        pendingEntryId  := "Range Short"
+        strategy.entry("Range Short", strategy.short)
+
+// Recalculate after the fill and anchor every price level to the actual simulated
+// fill. This is also what the Python bot does with the exchange fill price.
+if newPosition
+    entryPrice    := strategy.position_avg_price
+    entryATR      := na(pendingATR) ? atr : pendingATR
+    entryIsTrend  := pendingIsTrend
+
+    atrMult  = entryIsTrend ? trendATRmul : rangeATRmul
+    rr       = entryIsTrend ? trendRR : rangeRR
+    stopDist = math.min(entryATR * atrMult, maxSLPoints)
+
+    initialSL    := strategy.position_size > 0 ? entryPrice - stopDist : entryPrice + stopDist
+    takeProfit   := strategy.position_size > 0 ? entryPrice + stopDist * rr : entryPrice - stopDist * rr
+    effectiveStop := initialSL
+    beDone       := false
+    trailStage   := 0
+    trailArmed   := false
+    bestPrice    := na
+    trailStop    := na
+    lastLabeledStage := 0
+
+    pendingATR      := na
+    pendingIsTrend  := false
+    pendingEntryId  := ""
+
+// =============================================================================
+// RISK STATE MACHINE
+// Initial SL -> Breakeven floor -> Stage 1..5 trailing. Stop can only tighten.
+// =============================================================================
+if strategy.position_size != 0 and not na(entryPrice) and not na(entryATR)
+    isLong = strategy.position_size > 0
+    profitDist = isLong ? close - entryPrice : entryPrice - close
+
+    newStage = trailStage
+    if trailStage < 5 and profitDist >= entryATR * trail5Trigger
+        newStage := 5
+    else if trailStage < 4 and profitDist >= entryATR * trail4Trigger
+        newStage := 4
+    else if trailStage < 3 and profitDist >= entryATR * trail3Trigger
+        newStage := 3
+    else if trailStage < 2 and profitDist >= entryATR * trail2Trigger
+        newStage := 2
+    else if trailStage < 1 and profitDist >= entryATR * trail1Trigger
+        newStage := 1
+
+    if newStage > trailStage
+        trailStage := newStage
+        if trailStage > lastLabeledStage
+            label.new(bar_index, low, "S" + str.tostring(trailStage), color=stageColor(trailStage), textcolor=color.black, style=label.style_label_up, size=size.small)
+            lastLabeledStage := trailStage
+
+    // In the old script trail_points was supplied in price units even though
+    // TradingView defines it in ticks. Here Trail Pts is intentionally an ATR
+    // price-distance multiplier, exactly like the Python executor.
+    if not trailArmed and trailStage > 0
+        activationDist = entryATR * stagePts(trailStage)
+        if profitDist >= activationDist
+            trailArmed := true
+            bestPrice := close
+
+    if trailArmed
+        bestPrice := isLong ? math.max(nz(bestPrice, close), close) : math.min(nz(bestPrice, close), close)
+        trailGap = entryATR * stageOff(trailStage)
+        nextTrailStop = isLong ? bestPrice - trailGap : bestPrice + trailGap
+        trailStop := na(trailStop) ? nextTrailStop : (isLong ? math.max(trailStop, nextTrailStop) : math.min(trailStop, nextTrailStop))
+
+    if not beDone and profitDist > entryATR * beMult
+        beDone := true
+
+    effectiveStop := initialSL
+    if beDone
+        effectiveStop := isLong ? math.max(effectiveStop, entryPrice) : math.min(effectiveStop, entryPrice)
+    if trailArmed and not na(trailStop)
+        effectiveStop := isLong ? math.max(effectiveStop, trailStop) : math.min(effectiveStop, trailStop)
+
+    // A single exit ID owns the whole position. Omitting from_entry makes this
+    // protective exit apply to whichever single entry is open (pyramiding=0).
+    // This avoids competing exit IDs reserving portions of the position.
+    strategy.exit("Risk Exit", stop=effectiveStop, limit=takeProfit,
+         comment_profit="TP", comment_loss=trailArmed ? "Trail/SL" : beDone ? "BE/SL" : "Initial SL")
+
+    // Fail-safe. With the supplied defaults, the normal initial SL is tighter.
+    maxStopDist = math.min(entryATR * maxSLmult, maxSLPoints)
+    if (isLong and close <= entryPrice - maxStopDist) or (not isLong and close >= entryPrice + maxStopDist)
+        strategy.close_all(comment="Max SL Hit")
+
+prevPosSize := strategy.position_size
+
+// =============================================================================
+// VISUALS / PARITY DIAGNOSTICS
+// =============================================================================
+plot(emaTrend, "EMA Trend", color=color.orange, linewidth=2)
+plot(emaFast,  "EMA Fast",  color=color.blue, linewidth=1)
+plot(strategy.position_size != 0 ? effectiveStop : na, "Active Stop", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? takeProfit : na, "Take Profit", color=color.green, linewidth=1, style=plot.style_linebr)
+plotshape(strategy.position_size != 0, title="Trail Stage", style=shape.circle, location=location.belowbar, color=stageColor(trailStage), size=size.tiny)
+
+var table stateTable = table.new(position.top_right, 2, 8, border_width=1)
+if barstate.islast and showState
+    table.cell(stateTable, 0, 0, "Engine")
+    table.cell(stateTable, 1, 0, "ADX Regime ATR v2.1")
+    table.cell(stateTable, 0, 1, "Tick")
+    table.cell(stateTable, 1, 1, str.tostring(syminfo.mintick))
+    table.cell(stateTable, 0, 2, "Point value")
+    table.cell(stateTable, 1, 2, str.tostring(syminfo.pointvalue))
+    table.cell(stateTable, 0, 3, "Entry ATR")
+    table.cell(stateTable, 1, 3, na(entryATR) ? "-" : str.tostring(entryATR, format.mintick))
+    table.cell(stateTable, 0, 4, "Stage")
+    table.cell(stateTable, 1, 4, str.tostring(trailStage))
+    table.cell(stateTable, 0, 5, "BE")
+    table.cell(stateTable, 1, 5, beDone ? "ON" : "OFF")
+    table.cell(stateTable, 0, 6, "Stop")
+    table.cell(stateTable, 1, 6, na(effectiveStop) ? "-" : str.tostring(effectiveStop, format.mintick))
+    table.cell(stateTable, 0, 7, "TP")
+    table.cell(stateTable, 1, 7, na(takeProfit) ? "-" : str.tostring(takeProfit, format.mintick))

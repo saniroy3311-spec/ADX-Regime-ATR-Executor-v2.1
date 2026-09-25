@@ -1,0 +1,21 @@
+ADX Regime ATR Executor v2.1.0-parity
+Release date: 2026-09-25
+
+Primary artifacts in this repository:
+- ADX_Regime_ATR_Executor.exe  (Windows x64 launcher; requires Python 3.11+)
+- pine/ADX_Regime_ATR_Execution_Engine_v2_1.pine
+- docs/OPTIMIZATION_REPORT.md
+
+Validation completed before cache cleanup:
+- pytest -q: 14 passed, 1 skipped
+- python validate_setup.py: PASS (safe PAPER + TESTNET profile)
+- python -m compileall -q .: PASS
+- Windows launcher format: PE32+ x86-64
+
+Build-environment limitation:
+- The skipped test requires ccxt. The build container did not have ccxt installed and had no package-network access, so no authenticated Delta live/testnet order was sent from this environment.
+- The Pine script was checked against current Pine v6 documentation but was not compiled inside TradingView from this environment.
+
+SHA256:
+- EXE:  3e11ab927c124cbf42a33c19670e22293f9aebb33a36e49c928bc6b124aba276
+- Pine: 4440ead0ad89ffe152114dbef7f205d52d070e21e50dc33e9c6dcc30c5a2c3a6

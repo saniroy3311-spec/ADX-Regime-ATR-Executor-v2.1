@@ -6,7 +6,7 @@ The corrected Pine reference and the Python bot share one explicit state machine
 
 Key parity rules:
 - Entry decisions are made from confirmed strategy candles.
-- Entry ATR is frozen for the full trade.
+- ATR is recalculated from the live forming candle using Pine/Wilder RMA semantics.
 - Stage thresholds, breakeven, max-SL checks and trail movement run on live ticks
   by default (configurable to bar-close compatibility where supported).
 - Stage 0 has no trailing stop. A stage must unlock before the trail can arm.
@@ -26,7 +26,7 @@ import logging
 import time
 from typing import Callable, Optional
 from config import (
-    TRAIL_STAGES, BE_MULT, MAX_SL_MULT, MAX_SL_POINTS,
+    TRAIL_STAGES, BE_MULT, MAX_SL_MULT, MAX_SL_POINTS, ATR_LEN,
     TRAIL_LOOP_SEC, TRAIL_SL_PRE_FIRE_BUFFER,
     CANDLE_TIMEFRAME, TIME_EXIT_MINUTES, PINE_MINTICK,
     TREND_ATR_MULT, RANGE_ATR_MULT, TREND_RR, RANGE_RR,
@@ -169,7 +169,7 @@ def _upgrade_stage(current_stage: int, profit_dist: float, atr: float) -> int:
     """
     Returns the highest trail stage unlocked by profit_dist.
     Stages ratchet — only upgrade, never downgrade.
-    Rule: profitDist >= entryATR * triggerMult. No mintick conversion.
+    Rule: profitDist >= current realtime ATR * triggerMult. No mintick conversion.
     """
     new_stage = current_stage
     for i in range(len(TRAIL_STAGES) - 1, -1, -1):
@@ -197,7 +197,7 @@ class TrailMonitor:
       - best_price tracks the favorable running extreme.
       - trail SL = best_price +/- ATR trail offset.
       - Stage upgrades and breakeven ratchet on live ticks by default.
-      - Entry ATR is frozen for stable SL/TP/trail geometry.
+      - ATR updates intrabar from the live candle, matching Pine calc_on_every_tick.
 
     on_bar_close()           → confirmed-bar maintenance only
     on_price_tick()          → Binance WS feed (offset-adjusted):
@@ -223,8 +223,20 @@ class TrailMonitor:
         self._task             : Optional[asyncio.Task] = None
         self._exit_fired       : bool = False
 
-        self._current_atr      : float = 0.0  # frozen entry ATR for the active trade
-        # With calc_on_order_fills in the corrected Pine, SL/TP become valid on
+        # Pine v6 parity: ATR is dynamic on the realtime bar because the supplied
+        # strategy uses calc_on_every_tick=true and ta.atr(ATR_LEN).  Keep the
+        # previous CONFIRMED-bar ATR as the Wilder-RMA baseline, then recompute
+        # the live bar ATR from its expanding True Range on every authoritative
+        # price/candle update.
+        self._current_atr       : float = 0.0
+        self._confirmed_atr     : float = 0.0
+        self._prev_close        : float = 0.0
+        self._live_high         : float = 0.0
+        self._live_low          : float = 0.0
+        self._live_close        : float = 0.0
+        self._dynamic_initial_sl: float = 0.0
+        self._dynamic_tp        : float = 0.0
+        # With calc_on_every_tick in the reference Pine, SL/TP become live as
         # the post-fill recalculation. LIVE_TICK_RISK_ENGINE mirrors that behavior.
         self._static_orders_active: bool = False
 
@@ -308,7 +320,20 @@ class TrailMonitor:
         self._entry_bar_ms = entry_bar_time_ms
         self._exit_fired   = False
         self._running      = True
-        self._current_atr  = risk_levels.atr
+        self._current_atr   = risk_levels.atr
+        self._confirmed_atr = risk_levels.atr
+        # signal_close is the close of the just-confirmed signal bar and is the
+        # correct previous-close input for the first realtime bar's True Range.
+        self._prev_close = (
+            risk_levels.signal_close
+            if getattr(risk_levels, "signal_close", 0.0) > 0
+            else risk_levels.entry_price
+        )
+        self._live_high  = 0.0
+        self._live_low   = 0.0
+        self._live_close = 0.0
+        self._dynamic_initial_sl = risk_levels.sl
+        self._dynamic_tp         = risk_levels.tp
         self._static_orders_active = bool(LIVE_TICK_RISK_ENGINE)
 
         # Pine trail runtime state — reset on every new trade
@@ -361,6 +386,7 @@ class TrailMonitor:
             f"sl={risk_levels.sl:.2f} tp={risk_levels.tp:.2f}  "
             f"entry_atr={risk_levels.atr:.2f} is_long={risk_levels.is_long} |  "
             f"native_tick_semantics={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
+            f"dynamic_realtime_atr=True  "
             f"stage0_native_trail={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
             f"activation_pts={_trail_pts(1, risk_levels.atr):.2f}  "
             f"trail_off={_trail_off(1, risk_levels.atr):.2f}  "
@@ -398,7 +424,7 @@ class TrailMonitor:
         """
         Called at every confirmed bar close.
 
-        1. Keep the trade's entry ATR frozen (current_atr is diagnostics only)
+        1. Confirm the just-closed bar ATR and reset the realtime ATR baseline
         2. Optionally upgrade stage / breakeven in bar-close compatibility mode
         3. Update best_price from the bar extreme if the trail is armed
         4. Arm a stage-gated trail only when stage > 0
@@ -420,16 +446,19 @@ class TrailMonitor:
             if bar_open  > 0.0:
                 bar_open = bar_open - self._source_offset
 
-        # ── 1. Freeze ATR / static risk at the entry snapshot ───────────────
-        # The old implementation re-sized SL, TP, BE and the trail every 30m as
-        # ATR changed. That makes the same trade geometry drift after entry and
-        # is difficult to reproduce in live execution. The corrected Pine and
-        # Python bot both use the frozen entry ATR stored in risk.atr.
-        atr = risk.atr if risk.atr > 0 else self._current_atr
-        self._current_atr = atr
+        # ── 1. Confirm ATR and start a fresh realtime-bar ATR baseline ──────
+        # Pine ta.atr() is a Wilder RMA. At a realtime bar close, `current_atr`
+        # is the final ATR for that bar. It becomes the previous confirmed RMA
+        # value used to calculate the next forming bar's ATR tick-by-tick.
+        atr = current_atr if current_atr > 0 else (self._current_atr if self._current_atr > 0 else risk.atr)
+        self._confirmed_atr = atr
+        self._current_atr   = atr
+        self._prev_close    = bar_close
+        self._live_high     = 0.0
+        self._live_low      = 0.0
+        self._live_close    = 0.0
+        self._refresh_dynamic_orders()
 
-        # Record bar-close maintenance for diagnostics only. Initial SL and TP
-        # stay at risk.sl / risk.tp from the actual fill.
         self._last_initial_sl_bar_ms = self._entry_bar_end_ms
         self._static_orders_active = True
 
@@ -527,17 +556,18 @@ class TrailMonitor:
 
         # Supplied Pine uses strategy.exit(... limit=tp), so TP is a real exit.
         # The recovery bar-range path is disabled by default to avoid retroactive fills.
-        tp_hit = _hard_tp_enabled(risk) and ((bar_high  >= risk.tp) if is_long else (bar_low   <= risk.tp))
+        tp_level = self._dynamic_tp if self._dynamic_tp > 0 else risk.tp
+        tp_hit = _hard_tp_enabled(risk) and ((bar_high  >= tp_level) if is_long else (bar_low   <= tp_level))
         sl_hit = (bar_low   <= pre_trail_sl) if is_long else (bar_high  >= pre_trail_sl)
 
         if tp_hit or sl_hit:
             if tp_hit and sl_hit:
                 ref     = bar_open if bar_open  > 0.0 else bar_close
-                use_tp  = abs(ref - risk.tp)  <= abs(ref - pre_trail_sl)
-                exit_px = risk.tp        if use_tp else pre_trail_sl
+                use_tp  = abs(ref - tp_level) <= abs(ref - pre_trail_sl)
+                exit_px = tp_level       if use_tp else pre_trail_sl
                 reason  = "TP (bar)"    if use_tp else "SL (bar)"
             elif tp_hit:
-                exit_px = risk.tp
+                exit_px = tp_level
                 reason  = "TP (bar)"
             else:
                 exit_px = pre_trail_sl
@@ -791,6 +821,94 @@ class TrailMonitor:
                 logger.error(f"[TRAIL] Tick loop error: {e}", exc_info=True)
                 await asyncio.sleep(1.0)
 
+    # ── Realtime ATR / dynamic native-order geometry ─────────────────────────
+    def _update_realtime_atr(
+        self,
+        price: Optional[float] = None,
+        high: Optional[float] = None,
+        low: Optional[float] = None,
+    ) -> float:
+        """Update Pine-style ta.atr() for the currently forming bar.
+
+        With calc_on_every_tick=true Pine rolls the current bar back to the last
+        confirmed state on each tick, then evaluates ta.atr() from the current
+        bar's expanding True Range. For Wilder RMA this is exactly:
+
+            live_atr = (prev_confirmed_atr * (ATR_LEN - 1) + live_TR) / ATR_LEN
+
+        where live_TR is based on the forming bar high/low and the previous
+        confirmed close.  We therefore never recursively feed one intrabar ATR
+        tick into the next; `_confirmed_atr` changes only at a bar close.
+        """
+        if self._confirmed_atr <= 0 or ATR_LEN <= 0:
+            return self._current_atr
+
+        vals = [v for v in (price, high, low) if v is not None and float(v) > 0]
+        if not vals:
+            return self._current_atr
+
+        if high is not None and float(high) > 0:
+            h = float(high)
+            self._live_high = h if self._live_high <= 0 else max(self._live_high, h)
+        if low is not None and float(low) > 0:
+            l = float(low)
+            self._live_low = l if self._live_low <= 0 else min(self._live_low, l)
+        if price is not None and float(price) > 0:
+            px = float(price)
+            self._live_close = px
+            self._live_high = px if self._live_high <= 0 else max(self._live_high, px)
+            self._live_low  = px if self._live_low  <= 0 else min(self._live_low, px)
+
+        if self._live_high <= 0 or self._live_low <= 0:
+            return self._current_atr
+
+        prev_close = self._prev_close if self._prev_close > 0 else self._risk.entry_price
+        tr = max(
+            self._live_high - self._live_low,
+            abs(self._live_high - prev_close),
+            abs(self._live_low - prev_close),
+        )
+        if ATR_LEN == 1:
+            live_atr = tr
+        else:
+            live_atr = (self._confirmed_atr * (ATR_LEN - 1) + tr) / ATR_LEN
+
+        if live_atr > 0:
+            self._current_atr = live_atr
+        return self._current_atr
+
+    def _refresh_dynamic_orders(self) -> None:
+        """Recalculate the Pine primary stop/limit from the current realtime ATR.
+
+        The supplied Pine recomputes stopDist/SL/TP on every calculation. Before
+        BE/trailing takes control, the initial stop is therefore allowed to move
+        with ATR. Once BE or the native trail is active, the tighter protective
+        stop remains authoritative, while the hard TP continues to follow ATR.
+        """
+        risk = self._risk
+        state = self._state
+        if risk is None or state is None or self._current_atr <= 0:
+            return
+
+        atr_mult = TREND_ATR_MULT if risk.is_trend else RANGE_ATR_MULT
+        rr = TREND_RR if risk.is_trend else RANGE_RR
+        stop_dist = min(self._current_atr * atr_mult, MAX_SL_POINTS)
+
+        if risk.is_long:
+            dyn_sl = risk.entry_price - stop_dist
+            dyn_tp = risk.entry_price + stop_dist * rr
+        else:
+            dyn_sl = risk.entry_price + stop_dist
+            dyn_tp = risk.entry_price - stop_dist * rr
+
+        self._dynamic_initial_sl = dyn_sl
+        self._dynamic_tp = dyn_tp
+
+        # Before BE/trail activation, Pine's primary stop order itself is being
+        # modified on each realtime calculation, so it may tighten OR widen.
+        if not state.be_done and not getattr(state, "trail_armed", False):
+            state.current_sl = dyn_sl
+
     # ── Core tick evaluator — Pine trail engine ────────────────────────────────
     async def _evaluate_tick(self, price: float,  source: str = "other") -> None:
         """
@@ -823,7 +941,9 @@ class TrailMonitor:
 
         is_long     = risk.is_long
         entry_price = risk.entry_price
-        atr          = self._current_atr
+        self._update_realtime_atr(price=price)
+        self._refresh_dynamic_orders()
+        atr = self._current_atr
 
         # ── 0. Optional live-tick state updates ───────────────────────────────
         # Protective stop/TP/trail checks remain live. Strict parity defaults
@@ -851,11 +971,12 @@ class TrailMonitor:
         # Corrected Pine uses a hard limit TP after entryPrice is known on the
         # post-fill recalculation.
         if _hard_tp_enabled(risk) and self._static_orders_active:
-            if is_long and price  >= risk.tp:
-                await self._fire_exit(risk.tp, "TP", source="tick")
+            tp_level = self._dynamic_tp if self._dynamic_tp > 0 else risk.tp
+            if is_long and price >= tp_level:
+                await self._fire_exit(tp_level, "TP", source="tick")
                 return
-            if not is_long and price  <= risk.tp:
-                await self._fire_exit(risk.tp, "TP", source="tick")
+            if not is_long and price <= tp_level:
+                await self._fire_exit(tp_level, "TP", source="tick")
                 return
 
         # ── 2. Trail arm or initial SL ────────────────────────────────────────
@@ -1001,16 +1122,19 @@ class TrailMonitor:
 
         is_long     = risk.is_long
         entry_price = risk.entry_price
-        atr          = self._current_atr
+        self._update_realtime_atr(price=price)
+        self._refresh_dynamic_orders()
+        atr = self._current_atr
 
         # ── 1. TP hit ─────────────────────────────────────────────────────────
         # FIX-TP-PARITY: gated behind TP_HARD_EXIT — see note above.
         if _hard_tp_enabled(risk) and self._static_orders_active:
-            if is_long and price  >= risk.tp:
-                await self._fire_exit(risk.tp, "TP", source="tick")
+            tp_level = self._dynamic_tp if self._dynamic_tp > 0 else risk.tp
+            if is_long and price >= tp_level:
+                await self._fire_exit(tp_level, "TP", source="tick")
                 return
-            if not is_long and price  <= risk.tp:
-                await self._fire_exit(risk.tp, "TP", source="tick")
+            if not is_long and price <= tp_level:
+                await self._fire_exit(tp_level, "TP", source="tick")
                 return
 
         # ── 2. Trail SL hit check (using current_sl already set by Delta ticks) ──
@@ -1139,6 +1263,17 @@ class TrailMonitor:
                 return
             high = high - self._source_offset
             low  = low  - self._source_offset
+            if close > 0:
+                close = close - self._source_offset
+
+        # Candle high/low are authoritative for the forming bar's True Range,
+        # including extrema that may fall between ticker messages.
+        self._update_realtime_atr(
+            price=close if close > 0 else None,
+            high=high,
+            low=low,
+        )
+        self._refresh_dynamic_orders()
 
         try:
             loop = asyncio.get_running_loop()

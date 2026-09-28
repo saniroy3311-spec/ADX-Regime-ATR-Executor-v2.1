@@ -581,20 +581,35 @@ class OrderManager:
         logger.info(f"[OM] Closing position | mode={EXECUTION_MODE} side={side}  reason={reason}")
 
         if EXECUTION_MODE == "paper":
-            ticker = await self.fetch_ticker()
-            fill = float((ticker or {}).get("last") or (ticker or {}).get("markPrice") or expected_price or 0.0)
+            # PINE-EXIT-PARITY:
+            # The risk engine has already calculated the Pine-equivalent stop,
+            # TP, BE or trailing-stop level. Paper mode must record THAT level.
+            # Fetching a newer ticker here can give back 50-200+ points during a
+            # fast reversal and makes a correct strategy exit look wrong.
+            if expected_price is not None and float(expected_price) > 0:
+                fill = float(expected_price)
+                fill_source = "strategy_exit_level"
+            else:
+                ticker = await self.fetch_ticker()
+                fill = float((ticker or {}).get("last") or (ticker or {}).get("markPrice") or 0.0)
+                fill_source = "ticker_fallback"
+
             if fill <= 0:
-                raise RuntimeError("Paper exit could not obtain a live market price")
+                raise RuntimeError("Paper exit could not determine an exit price")
+
             qty = float((self._paper_position or {}).get("contracts") or self._order_qty)
             self._paper_seq += 1
             order = {
                 "id": f"paper-exit-{self._paper_seq}", "average": fill, "price": fill,
                 "amount": qty, "filled": qty, "status": "closed", "side": side,
-                "reduce_only": True, "paper": True,
+                "reduce_only": True, "paper": True, "fill_source": fill_source,
             }
             self._paper_position = None
             self._last_exit_order = dict(order)
-            logger.warning(f"[OM] PAPER exit filled @ {fill:.2f}; no exchange order was sent")
+            logger.warning(
+                f"[OM] PAPER exit filled @ {fill:.2f} "
+                f"(source={fill_source}, reason={reason}); no exchange order was sent"
+            )
             return order
         
         # FIX: Slippage check before closing

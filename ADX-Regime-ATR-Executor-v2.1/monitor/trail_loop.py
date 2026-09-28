@@ -191,7 +191,9 @@ def _hard_tp_enabled(risk: RiskLevels) -> bool:
 class TrailMonitor:
     """
     Tick-resolution implementation of the corrected custom Pine risk state machine.
-      - Trail arms only after a stage is unlocked and activation distance is crossed.
+      - Corrected mode arms only after a stage is unlocked.
+      - Legacy/native-Pine parity mode keeps the Stage-1 trail order active in
+        stage 0 because the reference Pine always submits trail_points/offset.
       - best_price tracks the favorable running extreme.
       - trail SL = best_price +/- ATR trail offset.
       - Stage upgrades and breakeven ratchet on live ticks by default.
@@ -358,6 +360,8 @@ class TrailMonitor:
             f"[TRAIL] Started | entry={risk_levels.entry_price:.2f}  "
             f"sl={risk_levels.sl:.2f} tp={risk_levels.tp:.2f}  "
             f"entry_atr={risk_levels.atr:.2f} is_long={risk_levels.is_long} |  "
+            f"native_tick_semantics={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
+            f"stage0_native_trail={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
             f"activation_pts={_trail_pts(1, risk_levels.atr):.2f}  "
             f"trail_off={_trail_off(1, risk_levels.atr):.2f}  "
             f"activation_price={_activation_price(risk_levels.entry_price, 1, risk_levels.atr, risk_levels.is_long):.2f} "
@@ -468,21 +472,30 @@ class TrailMonitor:
                 self._update_best_price(state, bar_extreme, is_long)
                 new_trail_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
                 self._apply_trail_sl(state, risk, new_trail_sl, is_long, source="bar_close")
-            elif state.stage > 0:
-                # No trailing order exists in stage 0. After a stage trigger has
-                # unlocked, apply that stage's TradingView activation distance.
-                act_price = _activation_price(entry_price, state.stage, atr, is_long)
-                armed = (bar_extreme >= act_price) if is_long else (bar_extreme <= act_price)
+            else:
+                # Native reference Pine keeps Stage-1 trailing parameters present
+                # even while trailStage == 0. Corrected mode remains stage-gated.
+                trail_order_stage = state.stage
+                if TRAIL_LEGACY_TV_TICK_SEMANTICS and trail_order_stage == 0:
+                    trail_order_stage = 1
+                if trail_order_stage <= 0:
+                    trail_order_stage = 0
+                if trail_order_stage > 0:
+                    act_price = _activation_price(entry_price, trail_order_stage, atr, is_long)
+                    armed = (bar_extreme >= act_price) if is_long else (bar_extreme <= act_price)
+                else:
+                    act_price = None
+                    armed = False
                 if armed:
                     state.trail_armed      = True
                     self._trail_ever_armed = True
                     state.best_price       = bar_extreme
-                    new_trail_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
+                    new_trail_sl = _trail_sl_from_best(state.best_price, trail_order_stage, atr, is_long)
                     self._apply_trail_sl(state, risk, new_trail_sl, is_long, source="bar_close_arm")
                     logger.info(
                         f"[TRAIL] Trail ARMED at bar close | stage={state.stage} "
-                        f"best={bar_extreme:.2f} trail_sl={state.current_sl:.2f} "
-                        f"act_price={act_price:.2f}"
+                        f"order_stage={trail_order_stage} best={bar_extreme:.2f} "
+                        f"trail_sl={state.current_sl:.2f} act_price={act_price:.2f}"
                     )
 
         # FIX-BUG2: Snapshot SL AFTER steps 5 &6 so that if trail just armed
@@ -847,25 +860,35 @@ class TrailMonitor:
 
         # ── 2. Trail arm or initial SL ────────────────────────────────────────
         if not getattr(state, 'trail_armed', False):
-            # Stage 0 deliberately has NO trailing stop. A stage must first be
-            # unlocked by its Stage Trigger; only then can its trail activate.
+            # REFERENCE-PINE PARITY:
+            # In the uploaded v5 Pine, strategy.exit() always contains
+            # trail_points/trail_offset. When trailStage == 0, its ternary
+            # expression falls back to Stage-1 values, so the trail can arm
+            # BEFORE the Stage-1 label threshold (0.8 ATR) is reached.
+            #
+            # In corrected/custom mode we keep the old stage-gated behavior.
+            trail_order_stage = state.stage
+            if TRAIL_LEGACY_TV_TICK_SEMANTICS and trail_order_stage == 0:
+                trail_order_stage = 1
+
             armed = False
             act_price = None
-            if state.stage > 0:
-                act_price = _activation_price(entry_price, state.stage, atr, is_long)
+            if trail_order_stage > 0:
+                act_price = _activation_price(entry_price, trail_order_stage, atr, is_long)
                 armed = (price >= act_price) if is_long else (price <= act_price)
 
             if armed:
                 state.trail_armed      = True
                 self._trail_ever_armed = True
                 state.best_price       = price
-                new_trail_sl = _trail_sl_from_best(price, state.stage, atr, is_long)
+                new_trail_sl = _trail_sl_from_best(price, trail_order_stage, atr, is_long)
                 self._apply_trail_sl(state, risk, new_trail_sl, is_long, source="arm_tick")
                 logger.info(
-                    f"[TRAIL] Trail ARMED | stage={state.stage} price={price:.2f} "
-                    f"act_price={act_price:.2f} trail_sl={state.current_sl:.2f} "
-                    f"trail_pts={_trail_pts(state.stage, atr):.2f} "
-                    f"trail_off={_trail_off(state.stage, atr):.2f}"
+                    f"[TRAIL] Trail ARMED | stage={state.stage} order_stage={trail_order_stage} "
+                    f"price={price:.2f} act_price={act_price:.2f} "
+                    f"trail_sl={state.current_sl:.2f} "
+                    f"trail_pts={_trail_pts(trail_order_stage, atr):.2f} "
+                    f"trail_off={_trail_off(trail_order_stage, atr):.2f}"
                 )
             else:
                 # Stage 0 / not-yet-armed: check initial / BE SL only.
@@ -878,7 +901,10 @@ class TrailMonitor:
 
                 if not _skip_initial_sl and self._sl_confirmed(price, sl_level, is_long, source=source):
                     reason = "Breakeven SL" if state.be_done else "Initial SL"
-                    await self._fire_exit(price, reason, source="tick")
+                    # A stop order is intended to execute at the active stop
+                    # level in the Pine broker model. Live fills may slip, but
+                    # PAPER parity must not record the later breach ticker.
+                    await self._fire_exit(state.current_sl, reason, source="tick")
                     return
 
                 # Max SL check — live tick in the requested execution model.
@@ -906,7 +932,10 @@ class TrailMonitor:
         # Stage upgrades were already evaluated at the start of this tick.
 
         # ── 4. Recompute trail SL from best_price ────────────────────────────
-        new_trail_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
+        trail_order_stage = state.stage
+        if TRAIL_LEGACY_TV_TICK_SEMANTICS and trail_order_stage == 0:
+            trail_order_stage = 1
+        new_trail_sl = _trail_sl_from_best(state.best_price, trail_order_stage, atr, is_long)
         self._apply_trail_sl(state, risk, new_trail_sl, is_long, source="tick")
 
         # ── 5. Trail SL hit check ─────────────────────────────────────────────
@@ -1002,7 +1031,9 @@ class TrailMonitor:
                 reason = f"Trail SL (stage {max(state.stage, 1)})"
             else:
                 reason = "Initial SL"
-            await self._fire_exit(price, reason, source="tick")
+            # PINE-EXIT-PARITY: record the active stop level, not the later
+            # breach tick. Live exchange fills remain whatever Delta reports.
+            await self._fire_exit(state.current_sl, reason, source="tick")
             return
 
         # ── 3. Max SL (entry bar exempt) ─────────────────────────────────────
@@ -1307,11 +1338,10 @@ class TrailMonitor:
             f"source={source} atr={self._current_atr:.2f} "
         )
 
-        try:
-            await self._order_mgr.cancel_bracket()
-        except Exception as e:
-            logger.warning(f"[TRAIL] cancel_bracket failed: {e}")
-
+        # EXIT-LATENCY-FIX: closing the position is the priority. Cancelling
+        # bracket legs first adds one or more network round-trips exactly when
+        # BTC can be reversing fastest. Send the reduce-only close first, then
+        # clean up surviving bracket orders after the close attempt succeeds.
         is_long = self._risk.is_long if self._risk else True
 
         MAX_ATTEMPTS = 3
@@ -1392,13 +1422,17 @@ class TrailMonitor:
             ticker = await self._order_mgr.fetch_ticker()
             if ticker is None:
                 return None
-            mark = (
-                ticker.get("markPrice")
+            # PINE-EXIT-PARITY: prefer the last-traded/chart price. Mark
+            # price is only a fallback for feed outages.
+            raw = (
+                ticker.get("last")
+                or ticker.get("close")
+                or (ticker.get("info") or {}).get("last_price")
+                or ticker.get("markPrice")
                 or (ticker.get("info") or {}).get("mark_price")
-                or ticker.get("last")
                 or 0.0
             )
-            price = float(mark) if mark else 0.0
+            price = float(raw) if raw else 0.0
             return price if price  > 0 else None
         except Exception as e:
             logger.warning(f"[TRAIL] _get_mark_price failed: {e}")

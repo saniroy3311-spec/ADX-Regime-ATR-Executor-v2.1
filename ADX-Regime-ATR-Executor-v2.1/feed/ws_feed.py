@@ -308,12 +308,15 @@ class CandleFeed:
                 if msg_type in ("ticker", "v2/ticker"):
                     data = msg.get("data") or msg
                     if data:
+                        # PINE-EXIT-PARITY: TradingView chart logic is driven by
+                        # traded/chart price, not Delta mark price. Prefer the
+                        # last-traded price and use mark only as a final fallback.
                         raw_price = (
-                            data.get("mark_price") or
                             data.get("last_price") or
                             data.get("close") or
                             data.get("c") or
                             data.get("p") or
+                            data.get("mark_price") or
                             0
                         )
                         try:

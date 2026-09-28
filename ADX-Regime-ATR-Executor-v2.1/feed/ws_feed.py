@@ -418,6 +418,7 @@ class CandleFeed:
                             self.trail_monitor.push_ws_candle(
                                 float(cb[2]), float(cb[3]),
                                 source = "binance" if feed_name == "Binance" else "delta",
+                                close  = float(cb[4]),
                             )
                     else:
                         logger.warning(
@@ -469,6 +470,16 @@ class CandleFeed:
             ).tail(MIN_BARS + 50)
             self._last_candle_boundary = current_boundary
 
+            # Pine calc_on_every_tick parity: this WS message is also the first
+            # update of the NEW forming bar. on_bar_close() above may have opened
+            # a position, so immediately seed the monitor with the new bar's
+            # OHLC/close instead of waiting for the next WS message.
+            if self.trail_monitor is not None and not BINANCE_SIGNAL_FEED:
+                self.trail_monitor.push_ws_candle(h, l, source="delta", close=c)
+                self._last_delta_tick = c
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.trail_monitor.push_delta_tick(c))
+
         else:
             if not BINANCE_SIGNAL_FEED and not self._df.empty:
                 idx = self._df.index[-1]
@@ -483,7 +494,7 @@ class CandleFeed:
                 loop.create_task(
                     self.trail_monitor.on_price_tick(c, source="delta")
                 )
-                self.trail_monitor.push_ws_candle(h, l, source="delta")
+                self.trail_monitor.push_ws_candle(h, l, source="delta", close=c)
 
             if self.trail_monitor is not None and not BINANCE_SIGNAL_FEED:
                 self._last_delta_tick = c   
@@ -538,6 +549,7 @@ class CandleFeed:
                             source = "binance" if (
                                 BINANCE_SIGNAL_FEED and self._binance_exchange is not None
                             ) else "delta",
+                            close = float(cb[4]),
                         )
                 except Exception as e:
                     logger.warning(f"[FEED] FIX-PEAK-REST (REST path) failed: {e}")
@@ -580,6 +592,12 @@ class CandleFeed:
                 self._df.at[idx, "low"]    = float(live_bar[3])
                 self._df.at[idx, "close"]  = float(live_bar[4])
                 self._df.at[idx, "volume"] = float(live_bar[5])
+
+            if self.trail_monitor is not None and not BINANCE_SIGNAL_FEED:
+                self.trail_monitor.push_ws_candle(
+                    float(live_bar[2]), float(live_bar[3]),
+                    source="delta", close=float(live_bar[4]),
+                )
 
     @staticmethod
     def _to_df(ohlcv: list) -> pd.DataFrame:

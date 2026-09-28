@@ -672,7 +672,10 @@ class ADXRegimeATRExecutor:
         self._fills_feed.start_task()
 
         _heartbeat.start(os.path.dirname(os.path.abspath(__file__)))
-        _start_client_dashboard()
+        # Dashboard intentionally disabled for this deployment. The user does not
+        # use it, and disabling it removes the 0.0.0.0:8081 port conflict without
+        # changing any trading/feed/order behavior.
+        logger.info("Client dashboard disabled — trading engine only")
         try:
             await feed.start()
         except asyncio.CancelledError:

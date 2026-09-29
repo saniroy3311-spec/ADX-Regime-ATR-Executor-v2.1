@@ -46,6 +46,9 @@ from config import (
     TRAIL_STAGE_UPDATE_MODE,
     BREAKEVEN_UPDATE_MODE,
     MAX_SL_EVAL_MODE,
+    SNIPER_V6_EXIT_PARITY,
+    DYNAMIC_REALTIME_ATR,
+    BREAKEVEN_ENABLED,
 )
 from risk.calculator import RiskLevels, TrailState
 
@@ -239,6 +242,7 @@ class TrailMonitor:
         # With calc_on_every_tick in the reference Pine, SL/TP become live as
         # the post-fill recalculation. LIVE_TICK_RISK_ENGINE mirrors that behavior.
         self._static_orders_active: bool = False
+        self._gap_fill_next_tick: bool = False
 
         self._entry_wall_ms    : int   = 0
 
@@ -334,7 +338,11 @@ class TrailMonitor:
         self._live_close = 0.0
         self._dynamic_initial_sl = risk_levels.sl
         self._dynamic_tp         = risk_levels.tp
-        self._static_orders_active = bool(LIVE_TICK_RISK_ENGINE)
+        # SNIPER v6: entryPrice is still na during the entry candle, so the
+        # Pine stop/limit are na -> only the native trail is live until the
+        # entry candle closes.
+        self._static_orders_active = bool(LIVE_TICK_RISK_ENGINE) and not SNIPER_V6_EXIT_PARITY
+        self._gap_fill_next_tick = False
 
         # Pine trail runtime state — reset on every new trade
         trail_state.trail_armed = False 
@@ -386,7 +394,9 @@ class TrailMonitor:
             f"sl={risk_levels.sl:.2f} tp={risk_levels.tp:.2f}  "
             f"entry_atr={risk_levels.atr:.2f} is_long={risk_levels.is_long} |  "
             f"native_tick_semantics={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
-            f"dynamic_realtime_atr=True  "
+            f"dynamic_realtime_atr={DYNAMIC_REALTIME_ATR}  "
+            f"sniper_v6_exit_parity={SNIPER_V6_EXIT_PARITY}  "
+            f"breakeven_enabled={BREAKEVEN_ENABLED}  "
             f"stage0_native_trail={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
             f"activation_pts={_trail_pts(1, risk_levels.atr):.2f}  "
             f"trail_off={_trail_off(1, risk_levels.atr):.2f}  "
@@ -461,6 +471,10 @@ class TrailMonitor:
 
         self._last_initial_sl_bar_ms = self._entry_bar_end_ms
         self._static_orders_active = True
+        # Levels may just have moved (new ATR / first SL of the trade). If the
+        # very next real price is already beyond one, TradingView fills at
+        # that price (next bar open), not at the level.
+        self._gap_fill_next_tick = bool(SNIPER_V6_EXIT_PARITY)
 
         # ── 2. Stage upgrade (compatibility bar-close mode) ─────────────────
         # Strict/live parity defaults to tick mode because the corrected Pine
@@ -488,7 +502,7 @@ class TrailMonitor:
                 )
 
         # ── 3. Breakeven check ──────────────────────────────────────────────
-        if BREAKEVEN_UPDATE_MODE == "bar_close" and (not state.be_done) and close_profit > atr * BE_MULT:
+        if BREAKEVEN_ENABLED and BREAKEVEN_UPDATE_MODE == "bar_close" and (not state.be_done) and close_profit > atr * BE_MULT:
             self._activate_be(state, risk, is_long, atr, source="bar_close")
 
         # ── 4. Bar extreme: advance best_price or check stage-gated arm ──────
@@ -536,7 +550,7 @@ class TrailMonitor:
         # ── 5. Close-only Max SL check ───────────────────────────────────────
         # Pine uses strategy.close_all() only when the CONFIRMED close crosses
         # the dynamic max-SL threshold. It is not an intrabar/tick stop.
-        if MAX_SL_EVAL_MODE == "bar_close" and (not is_entry_bar) and (not state.max_sl_fired):
+        if MAX_SL_EVAL_MODE == "bar_close" and (SNIPER_V6_EXIT_PARITY or not is_entry_bar) and (not state.max_sl_fired):
             max_thresh = min(atr * MAX_SL_MULT, MAX_SL_POINTS)
             max_hit = (bar_close <= entry_price - max_thresh) if is_long else (bar_close >= entry_price + max_thresh)
             if max_hit:
@@ -786,7 +800,7 @@ class TrailMonitor:
                 if self._risk is not None and self._pos_poll_ticks  >= POSITION_POLL_TICKS:
                     self._pos_poll_ticks = 0
                     try:
-                        pos = await self._order_mgr.fetch_open_position()
+                        pos = await self._order_mgr.fetch_open_position(strict=True)
                         if pos is None:
                             logger.warning(
                                 "[TRAIL] FIX-10: Position no longer exists on Delta —  "
@@ -840,6 +854,9 @@ class TrailMonitor:
         confirmed close.  We therefore never recursively feed one intrabar ATR
         tick into the next; `_confirmed_atr` changes only at a bar close.
         """
+        if not DYNAMIC_REALTIME_ATR:
+            # Closed-candle ATR only (TradingView "On bar close").
+            return self._current_atr
         if self._confirmed_atr <= 0 or ATR_LEN <= 0:
             return self._current_atr
 
@@ -945,6 +962,12 @@ class TrailMonitor:
         self._refresh_dynamic_orders()
         atr = self._current_atr
 
+        # SNIPER v6 gap fill: only a real Delta price consumes the flag.
+        gap_fill = False
+        if self._gap_fill_next_tick and source == "delta":
+            gap_fill = True
+            self._gap_fill_next_tick = False
+
         # ── 0. Optional live-tick state updates ───────────────────────────────
         # Protective stop/TP/trail checks remain live. Strict parity defaults
         # stage/BE updates to tick mode, matching calc_on_every_tick=true.
@@ -964,7 +987,7 @@ class TrailMonitor:
                         new_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
                         self._apply_trail_sl(state, risk, new_sl, is_long, source="stage_upgrade_tick")
 
-            if BREAKEVEN_UPDATE_MODE == "tick" and (not state.be_done) and profit_dist > atr * BE_MULT:
+            if BREAKEVEN_ENABLED and BREAKEVEN_UPDATE_MODE == "tick" and (not state.be_done) and profit_dist > atr * BE_MULT:
                 self._activate_be(state, risk, is_long, atr, source="live_tick")
 
         # ── 1. TP hit ─────────────────────────────────────────────────────────
@@ -973,10 +996,10 @@ class TrailMonitor:
         if _hard_tp_enabled(risk) and self._static_orders_active:
             tp_level = self._dynamic_tp if self._dynamic_tp > 0 else risk.tp
             if is_long and price >= tp_level:
-                await self._fire_exit(tp_level, "TP", source="tick")
+                await self._fire_exit(price if gap_fill else tp_level, "TP", source="tick")
                 return
             if not is_long and price <= tp_level:
-                await self._fire_exit(tp_level, "TP", source="tick")
+                await self._fire_exit(price if gap_fill else tp_level, "TP", source="tick")
                 return
 
         # ── 2. Trail arm or initial SL ────────────────────────────────────────
@@ -1025,7 +1048,7 @@ class TrailMonitor:
                     # A stop order is intended to execute at the active stop
                     # level in the Pine broker model. Live fills may slip, but
                     # PAPER parity must not record the later breach ticker.
-                    await self._fire_exit(state.current_sl, reason, source="tick")
+                    await self._fire_exit(price if gap_fill else state.current_sl, reason, source="tick")
                     return
 
                 # Max SL check — live tick in the requested execution model.
@@ -1080,7 +1103,7 @@ class TrailMonitor:
             # Fire at state.current_sl — this is the price TV's Exit label shows.
             # The model records the active stop level as the intended exit level.
             # A real market fill may differ because of spread, latency and liquidity.
-            await self._fire_exit(state.current_sl, reason, source="tick")
+            await self._fire_exit(price if gap_fill else state.current_sl, reason, source="tick")
             return
 
         # ── 6. Max SL — live tick ───────────────────────────────────────────

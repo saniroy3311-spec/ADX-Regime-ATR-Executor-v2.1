@@ -112,6 +112,20 @@ BE_MULT = _f("BE_MULT", 0.6)
 # - ENTRY_ATR is frozen at the signal/entry, so risk does not drift mid-trade.
 # Legacy mode is retained only for regression comparison with the old script bug.
 TRAIL_LEGACY_TV_TICK_SEMANTICS = _b("TRAIL_LEGACY_TV_TICK_SEMANTICS", False)
+# ── SNIPER v6 EXIT PARITY ────────────────────────────────────────────────
+# Copies how "BTCUSDT Sniper v6" really exits on TradingView when
+# Script execution = "On bar close":
+#   * ATR only changes when a 30m candle closes (no live intrabar ATR)
+#   * NO initial SL / TP during the entry candle (only the native trail)
+#   * Max-SL is also checked at the close of the entry candle
+#   * the first price after a candle close that is already beyond a level
+#     that just moved is filled at that price (TradingView fills at bar open)
+SNIPER_V6_EXIT_PARITY = _b("SNIPER_V6_EXIT_PARITY", False)
+DYNAMIC_REALTIME_ATR = _b("DYNAMIC_REALTIME_ATR", not SNIPER_V6_EXIT_PARITY)
+# In Sniper v6 the BE-* strategy.exit orders sit behind the main exit order,
+# which already reserves 100% of the position, so they normally never fill.
+BREAKEVEN_ENABLED = _b("BREAKEVEN_ENABLED", True)
+
 TRAIL_STAGE_UPDATE_MODE = os.environ.get("TRAIL_STAGE_UPDATE_MODE", "tick").strip().lower()
 BREAKEVEN_UPDATE_MODE = os.environ.get("BREAKEVEN_UPDATE_MODE", "tick").strip().lower()
 MAX_SL_EVAL_MODE = os.environ.get("MAX_SL_EVAL_MODE", "tick").strip().lower()

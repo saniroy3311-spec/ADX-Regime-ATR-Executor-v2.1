@@ -307,8 +307,12 @@ class OrderManager:
             return float(amount)
 
     # ── Position query ────────────────────────────────────────────────────────
-    async def fetch_open_position(self) -> Optional[dict]:
-        """Return a simplified position dict if an open position exists, else None."""
+    async def fetch_open_position(self, strict: bool = False) -> Optional[dict]:
+        """Return a simplified position dict if an open position exists, else None.
+
+        strict=True re-raises API/network errors instead of returning None, so a
+        temporary error can never be mistaken for "position is closed".
+        """
         if EXECUTION_MODE == "paper":
             return dict(self._paper_position) if self._paper_position else None
         try:
@@ -332,6 +336,8 @@ class OrderManager:
                     }
         except Exception as exc:
             logger.warning(f"[OM] fetch_open_position failed: {exc}")
+            if strict:
+                raise
         return None
 
     async def fetch_position(self) -> Optional[dict]:

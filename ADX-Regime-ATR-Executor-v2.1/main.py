@@ -236,7 +236,7 @@ class ADXRegimeATRExecutor:
     async def _on_bar_close(self, df) -> None:
         if self._in_position and not self._entry_lock.locked():
             try:
-                actual = await self._order_mgr.fetch_open_position()
+                actual = await self._order_mgr.fetch_open_position(strict=True)
                 if actual is None:
                     logger.warning(
                         "[BAR] State drift detected: in_position=True but Delta "

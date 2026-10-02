@@ -263,6 +263,7 @@ class CandleFeed:
                 "channels": [
                     {"name": channel,    "symbols": [ws_symbol]},
                     {"name": "ticker", "symbols": [ws_symbol]},
+                    {"name": "all_trades", "symbols": [ws_symbol]},
                 ]
             }
         })
@@ -270,7 +271,7 @@ class CandleFeed:
 
         logger.info(
             f"WebSocket connecting → {ws_url} | "
-            f"channels={channel},ticker symbol={ws_symbol}"
+            f"channels={channel},ticker,all_trades symbol={ws_symbol}"
         )
 
         async with websockets.connect(
@@ -300,9 +301,41 @@ class CandleFeed:
 
                 self._msg_count += 1
                 if self._msg_count <= 10 and msg_type not in (
-                    channel, "ticker", "v2/ticker", "subscriptions", "heartbeat", "pong"
+                    channel, "ticker", "v2/ticker", "all_trades", "all_trades_snapshot",
+                    "subscriptions", "heartbeat", "pong"
                 ):
                     logger.debug(f"WS msg #{self._msg_count} type={msg_type!r}")
+
+                if msg_type == "all_trades_snapshot":
+                    # ALL-TRADES-FIX: snapshot = old trades from BEFORE subscribe/entry.
+                    # Never feed them to the trail (an old high would fake best_price).
+                    continue
+
+                if msg_type == "all_trades":
+                    # ALL-TRADES-FIX: every real Delta trade, in order, no 5 s throttle.
+                    tdata = msg.get("data") or msg
+                    try:
+                        trade_price = float(tdata.get("price") or tdata.get("p") or 0)
+                    except (TypeError, ValueError):
+                        trade_price = 0.0
+                    ts_raw = tdata.get("timestamp")
+                    if ts_raw:
+                        try:
+                            ts_val = float(ts_raw)
+                            ts_s = ts_val / 1e6 if ts_val > 1e14 else (ts_val / 1e3 if ts_val > 1e11 else ts_val)
+                            if time.time() - ts_s > 10.0:
+                                trade_price = 0.0  # stale/replayed trade -> ignore
+                        except (TypeError, ValueError):
+                            pass
+                    if trade_price > 0:
+                        if not getattr(self, "_all_trades_logged", False):
+                            logger.info(f"[FEED] all_trades stream active ✅ first trade price={trade_price:.2f}")
+                            self._all_trades_logged = True
+                        self._last_delta_tick = trade_price
+                        if self.trail_monitor is not None:
+                            self.trail_monitor._last_ws_trade_wall_s = time.time()
+                            await self.trail_monitor.push_delta_tick(trade_price)
+                    continue
 
                 if msg_type in ("ticker", "v2/ticker"):
                     data = msg.get("data") or msg
@@ -322,7 +355,10 @@ class CandleFeed:
                             delta_price = float(raw_price)
                         except (TypeError, ValueError):
                             delta_price = 0.0
-                        if delta_price > 0 and self.trail_monitor is not None:
+                        # ALL-TRADES-FIX: ticker (5 s) is only a fallback when no fresh trade
+                        if delta_price > 0 and self.trail_monitor is not None and (
+                            time.time() - getattr(self.trail_monitor, "_last_ws_trade_wall_s", 0.0) >= 3.0
+                        ):
                             # EXIT-PARITY-FIX-v2: the ticker stream is the single
                             # authoritative intrabar price source. Process it in
                             # order instead of spawning overlapping tasks. This

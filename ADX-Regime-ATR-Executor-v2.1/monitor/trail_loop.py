@@ -820,6 +820,10 @@ class TrailMonitor:
                         logger.warning(f"[TRAIL] FIX-10: Position poll failed (keeping trail): {poll_err}")
                 # ── END POSITION GUARD ────────────────────────────────────────
 
+                # ALL-TRADES-FIX: skip the REST ticker while the Delta all_trades
+                # stream is fresh; a REST price can be older than the last real trade.
+                if time.time() - getattr(self, "_last_ws_trade_wall_s", 0.0) < 3.0:
+                    continue
                 price = await self._get_mark_price()
                 if price is None or price  <= 0:
                     continue

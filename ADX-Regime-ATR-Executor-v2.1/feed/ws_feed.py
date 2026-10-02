@@ -263,7 +263,7 @@ class CandleFeed:
                 "channels": [
                     {"name": channel,    "symbols": [ws_symbol]},
                     {"name": "ticker", "symbols": [ws_symbol]},
-                    {"name": "all_trades", "symbols": [ws_symbol]},
+                    {"name": "trades", "symbols": [ws_symbol]},
                 ]
             }
         })
@@ -271,7 +271,7 @@ class CandleFeed:
 
         logger.info(
             f"WebSocket connecting → {ws_url} | "
-            f"channels={channel},ticker,all_trades symbol={ws_symbol}"
+            f"channels={channel},ticker,trades symbol={ws_symbol}"
         )
 
         async with websockets.connect(
@@ -301,7 +301,7 @@ class CandleFeed:
 
                 self._msg_count += 1
                 if self._msg_count <= 10 and msg_type not in (
-                    channel, "ticker", "v2/ticker", "all_trades", "all_trades_snapshot",
+                    channel, "ticker", "v2/ticker", "all_trades", "all_trades_snapshot", "trades",
                     "subscriptions", "heartbeat", "pong"
                 ):
                     logger.debug(f"WS msg #{self._msg_count} type={msg_type!r}")
@@ -311,20 +311,30 @@ class CandleFeed:
                     # Never feed them to the trail (an old high would fake best_price).
                     continue
 
-                if msg_type == "all_trades":
+                if msg_type in ("all_trades", "trades"):  # TRADES-CHANNEL-FIX
                     # ALL-TRADES-FIX: every real Delta trade, in order, no 5 s throttle.
                     tdata = msg.get("data") or msg
                     try:
                         trade_price = float(tdata.get("price") or tdata.get("p") or 0)
                     except (TypeError, ValueError):
                         trade_price = 0.0
-                    ts_raw = tdata.get("timestamp")
+                    ts_raw = tdata.get("t") or tdata.get("timestamp")
                     if ts_raw:
                         try:
                             ts_val = float(ts_raw)
                             ts_s = ts_val / 1e6 if ts_val > 1e14 else (ts_val / 1e3 if ts_val > 1e11 else ts_val)
                             if time.time() - ts_s > 10.0:
                                 trade_price = 0.0  # stale/replayed trade -> ignore
+                        except (TypeError, ValueError):
+                            pass
+                    # TRADES-CHANNEL-FIX: drop replayed/out-of-order trades (older than last)
+                    if trade_price > 0 and ts_raw:
+                        try:
+                            t_now = float(ts_raw)
+                            if t_now < getattr(self, "_last_trade_t", 0.0):
+                                trade_price = 0.0
+                            else:
+                                self._last_trade_t = t_now
                         except (TypeError, ValueError):
                             pass
                     if trade_price > 0:

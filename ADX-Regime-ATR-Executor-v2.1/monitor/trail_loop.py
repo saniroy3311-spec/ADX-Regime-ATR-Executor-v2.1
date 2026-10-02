@@ -276,6 +276,12 @@ class TrailMonitor:
         # wicks before they ever reach the breach counter above.
         self._last_delta_price    : Optional[float] = None
 
+        # EXIT-PARITY-FIX-v2: serialize authoritative Delta price handling.
+        # Older code spawned overlapping tasks from ticker + candlestick
+        # messages, which could let a retracement check run before the preceding
+        # favourable price update had raised best_price / the trail stop.
+        self._delta_tick_lock = asyncio.Lock()
+
         # FIX-14: Recovery state for the FIX-13 wick filter (see constants
         # above). Tracks a run of consecutive same-direction rejections and
         # the wall-clock time of the last accepted tick, so a real multi-tick
@@ -652,88 +658,80 @@ class TrailMonitor:
     # ── Delta mark price tick — no offset needed ──────────────────────────────
     async def push_delta_tick(self, price: float) -> None:
         """
-        Accept a Delta Exchange mark price tick directly.
-        No Binance offset arithmetic — feeds straight into _evaluate_tick().
+        Accept one authoritative Delta last-traded-price tick.
 
-        FIX-6: Delta IS the authoritative price source  (same as Pine uses).
-        Always calls the full _evaluate_tick() — updates best_price post-arm.
-        Binance ticks post-arm only check SL/TP, not best_price.
+        EXIT-PARITY-FIX-v2:
+          - Delta ticker ticks are processed strictly in arrival order.
+          - No overlapping ticker/candlestick tasks can reorder best_price and
+            trailing-stop checks.
+          - Candlestick OHLC is handled separately by push_ws_candle(); it is
+            not treated as a second live tick stream.
 
-        FIX-8 (Option 1):  tagged source="delta" so _sl_confirmed() counts
-        only Delta ticks toward the breach confirmation counter.
-
-        FIX-13: Before anything else, reject single-tick wicks. If this tick
-        jumps more than MAX_DELTA_TICK_JUMP pts from the last accepted Delta
-        tick, treat it as exchange noise and drop it — it never reaches the
-        breach counter, never resets it, never updates best_price. A genuine
-        price move shows up as several ticks of this size in a row, so real
-        moves are unaffected; a single freak tick is.
-
-        FIX-14: FIX-13 alone has no way back if the reference ever goes
-        stale (e.g. one wrongly-rejected tick freezes _last_delta_price, and
-        every following real tick then also reads as "too far from a stale
-        number" forever). Two recovery paths re-sync the reference:
-          - STREAK: WICK_STREAK_CONFIRM consecutive rejects in the same
-            direction = a real run, not noise → accept and resume.
-          - STALE TIMEOUT: no tick accepted for WICK_STALE_TIMEOUT_S →
-            accept the next tick unconditionally (covers feed gaps).
+        Existing wick-filter behaviour is preserved. In PINE_PARITY_MODE its
+        thresholds resolve to pass-through values, so normal parity behaviour
+        is unchanged apart from deterministic ordering.
         """
-        if not self._running or self._exit_fired or price  <= 0:
+        if not self._running or self._exit_fired or price <= 0:
             return
 
-        now_s = time.time()
+        async with self._delta_tick_lock:
+            # The trade may have exited while this tick was waiting for the lock.
+            if not self._running or self._exit_fired or price <= 0:
+                return
 
-        if self._last_delta_price is not None:
-            jump = price - self._last_delta_price
-            abs_jump = abs(jump)
+            now_s = time.time()
 
-            if abs_jump  > MAX_DELTA_TICK_JUMP:
-                stale_for = now_s - self._last_delta_accept_wall_s
+            if self._last_delta_price is not None:
+                jump = price - self._last_delta_price
+                abs_jump = abs(jump)
 
-                # FIX-14a: feed gap recovery — too long since any accepted tick
-                if stale_for  >= WICK_STALE_TIMEOUT_S:
-                    logger.info(
-                        f"[TRAIL] Wick filter stale-timeout override — no tick  "
-                        f"accepted for {stale_for:.1f}s, force-accepting  "
-                        f"price={price:.2f} (was last={self._last_delta_price:.2f}) "
-                    )
-                    self._wick_reject_streak = 0
-                    self._wick_reject_dir = 0
-                    # falls through to acceptance below
+                if abs_jump > MAX_DELTA_TICK_JUMP:
+                    stale_for = now_s - self._last_delta_accept_wall_s
 
-                else:
-                    direction = 1 if jump  > 0 else -1
-                    if direction == self._wick_reject_dir:
-                        self._wick_reject_streak += 1
-                    else:
-                        self._wick_reject_streak = 1
-                        self._wick_reject_dir = direction
-
-                    if self._wick_reject_streak  < WICK_STREAK_CONFIRM:
-                        logger.warning(
-                            f"[TRAIL] Delta tick wick ignored — price {price:.2f} jumped  "
-                            f"{jump:+.2f} pts from last={self._last_delta_price:.2f}  "
-                            f"(> max={MAX_DELTA_TICK_JUMP:.1f} pts) — dropped, not counted  "
-                            f"[streak={self._wick_reject_streak}/{WICK_STREAK_CONFIRM}] "
+                    # FIX-14a: feed gap recovery — too long since any accepted tick
+                    if stale_for >= WICK_STALE_TIMEOUT_S:
+                        logger.info(
+                            f"[TRAIL] Wick filter stale-timeout override — no tick "
+                            f"accepted for {stale_for:.1f}s, force-accepting "
+                            f"price={price:.2f} (was last={self._last_delta_price:.2f}) "
                         )
-                        return
+                        self._wick_reject_streak = 0
+                        self._wick_reject_dir = 0
+                        # falls through to acceptance below
 
-                    # FIX-14b: streak recovery — N consecutive same-direction
-                    # rejects means this is a real move, not repeated noise
-                    logger.info(
-                        f"[TRAIL] Wick filter streak override —  "
-                        f"{self._wick_reject_streak} consecutive same-direction  "
-                        f"ticks, accepting price={price:.2f} as a real move  "
-                        f"(was last={self._last_delta_price:.2f}) "
-                    )
-                    self._wick_reject_streak = 0
-                    self._wick_reject_dir = 0
-                    # falls through to acceptance below
+                    else:
+                        direction = 1 if jump > 0 else -1
+                        if direction == self._wick_reject_dir:
+                            self._wick_reject_streak += 1
+                        else:
+                            self._wick_reject_streak = 1
+                            self._wick_reject_dir = direction
 
-        self._last_delta_price = price
-        self._last_delta_accept_wall_s = now_s
-        logger.debug(f"[TRAIL] Delta tick {price:.2f}")
-        await self._evaluate_tick(price, source="delta")
+                        if self._wick_reject_streak < WICK_STREAK_CONFIRM:
+                            logger.warning(
+                                f"[TRAIL] Delta tick wick ignored — price {price:.2f} jumped "
+                                f"{jump:+.2f} pts from last={self._last_delta_price:.2f} "
+                                f"(> max={MAX_DELTA_TICK_JUMP:.1f} pts) — dropped, not counted "
+                                f"[streak={self._wick_reject_streak}/{WICK_STREAK_CONFIRM}] "
+                            )
+                            return
+
+                        # FIX-14b: streak recovery — N consecutive same-direction
+                        # rejects means this is a real move, not repeated noise
+                        logger.info(
+                            f"[TRAIL] Wick filter streak override — "
+                            f"{self._wick_reject_streak} consecutive same-direction "
+                            f"ticks, accepting price={price:.2f} as a real move "
+                            f"(was last={self._last_delta_price:.2f}) "
+                        )
+                        self._wick_reject_streak = 0
+                        self._wick_reject_dir = 0
+                        # falls through to acceptance below
+
+            self._last_delta_price = price
+            self._last_delta_accept_wall_s = now_s
+            logger.debug(f"[TRAIL] Delta tick {price:.2f}")
+            await self._evaluate_tick(price, source="delta")
 
     async def _recalibrate_offset(self, binance_price_raw: float) -> None:
         if PINE_PARITY_MODE:
@@ -825,10 +823,10 @@ class TrailMonitor:
                 price = await self._get_mark_price()
                 if price is None or price  <= 0:
                     continue
-                # REST poll uses Delta mark price — always full _evaluate_tick()
-                # FIX-8: tagged source="delta" — REST polls Delta mark price,
-                # so these count toward the breach tick counter too.
-                await self._evaluate_tick(price, source="delta")
+                # EXIT-PARITY-FIX-v2: REST safety-net prices use the same
+                # serialized authoritative Delta path as websocket ticker ticks.
+                # This prevents the 5-second fallback poll from racing a WS tick.
+                await self.push_delta_tick(price)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1270,11 +1268,27 @@ class TrailMonitor:
             )
 
     # ── WS candle peak update ──────────────────────────────────────────────────
-    def push_ws_candle(self, high: float, low: float, source: str = "binance", close: float = 0.0, **kwargs) -> None:
+    def push_ws_candle(
+        self,
+        high: float,
+        low: float,
+        source: str = "binance",
+        close: float = 0.0,
+        evaluate_extreme: bool = True,
+        **kwargs,
+    ) -> None:
         """
-        Intrabar WS candle update — advance best_price from favourable extreme only.
-        The adverse extreme is NOT evaluated here to avoid stale-candle-high exits.
-        SL firing is left to on_price_tick() (live trade price).
+        Receive an intrabar candle update.
+
+        Candle OHLC is useful for ATR/bar bookkeeping, but a running candle's
+        high/low is cumulative and does not tell us WHEN that extreme happened.
+        On the entry bar it may even include an extreme from before the actual
+        fill. Therefore the Delta candle feed can set evaluate_extreme=False
+        and let the last-traded-price ticker be the only live trail driver.
+
+        A second guard disables candle-extreme trail evaluation for the whole
+        Sniper-v6 entry bar. Post-entry ticker ticks still update best_price in
+        real time, so no legitimate post-fill move is lost.
         """
         if not self._running or self._exit_fired or self._state is None or self._risk is None:
             return
@@ -1289,8 +1303,7 @@ class TrailMonitor:
             if close > 0:
                 close = close - self._source_offset
 
-        # Candle high/low are authoritative for the forming bar's True Range,
-        # including extrema that may fall between ticker messages.
+        # Candle high/low remain useful for realtime ATR bookkeeping.
         self._update_realtime_atr(
             price=close if close > 0 else None,
             high=high,
@@ -1298,15 +1311,28 @@ class TrailMonitor:
         )
         self._refresh_dynamic_orders()
 
+        # Never use a cumulative candle extreme as a live trail tick during the
+        # entry bar in Sniper-v6 parity mode. The candle began before the fill.
+        if (
+            SNIPER_V6_EXIT_PARITY
+            and self._entry_bar_end_ms > 0
+            and int(time.time() * 1000) < self._entry_bar_end_ms
+        ):
+            evaluate_extreme = False
+
+        if not evaluate_extreme:
+            return
+
         try:
             loop = asyncio.get_running_loop()
             if TRAIL_FIRE_SL_ON_CANDLE_EXTREME:
-                # Old behaviour: evaluate both extremes (can fire on stale candle)
+                # Legacy behaviour: evaluate both extremes.
                 tp_side = high if is_long else low
                 sl_side = low  if is_long else high
                 loop.create_task(self._evaluate_tick_pair(tp_side, sl_side))
             else:
-                # Default (FIX): evaluate only the favourable extreme
+                # Favourable-extreme recovery path. Live Delta ws_feed disables
+                # this intrabar and relies on ordered ticker ticks instead.
                 favourable = high if is_long else low
                 loop.create_task(self._evaluate_tick(favourable))
         except RuntimeError:
@@ -1491,9 +1517,13 @@ class TrailMonitor:
             return
         self._exit_fired = True
 
+        _state = self._state
         logger.info(
             f"[TRAIL] Exit fired: reason={reason} price={exit_price:.2f}  "
             f"source={source} atr={self._current_atr:.2f} "
+            f"stage={getattr(_state, 'stage', 0)} "
+            f"best={getattr(_state, 'best_price', 0.0):.2f} "
+            f"active_sl={getattr(_state, 'current_sl', 0.0):.2f} "
         )
 
         # EXIT-LATENCY-FIX: closing the position is the priority. Cancelling

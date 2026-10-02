@@ -18,7 +18,6 @@ from config import (
     DELTA_API_KEY, DELTA_API_SECRET, DELTA_TESTNET, DELTA_REST_URL,
     SYMBOL, CANDLE_TIMEFRAME, WS_RECONNECT_SEC, EMA_TREND_LEN,
     BINANCE_SIGNAL_FEED, BINANCE_SYMBOL,
-    TRAIL_EXIT_FROM_DELTA_WS,
 )
 
 logger   = logging.getLogger(__name__)
@@ -324,11 +323,13 @@ class CandleFeed:
                         except (TypeError, ValueError):
                             delta_price = 0.0
                         if delta_price > 0 and self.trail_monitor is not None:
+                            # EXIT-PARITY-FIX-v2: the ticker stream is the single
+                            # authoritative intrabar price source. Process it in
+                            # order instead of spawning overlapping tasks. This
+                            # prevents an older/lower close from firing the trail
+                            # before a newer favourable tick has updated best_price.
                             self._last_delta_tick = delta_price
-                            loop = asyncio.get_running_loop()
-                            loop.create_task(
-                                self.trail_monitor.push_delta_tick(delta_price)
-                            )
+                            await self.trail_monitor.push_delta_tick(delta_price)
                     continue
 
                 if msg_type not in (channel, f"candlestick_{CANDLE_TIMEFRAME}"):
@@ -419,6 +420,7 @@ class CandleFeed:
                                 float(cb[2]), float(cb[3]),
                                 source = "binance" if feed_name == "Binance" else "delta",
                                 close  = float(cb[4]),
+                                evaluate_extreme = False,
                             )
                     else:
                         logger.warning(
@@ -470,15 +472,14 @@ class CandleFeed:
             ).tail(MIN_BARS + 50)
             self._last_candle_boundary = current_boundary
 
-            # Pine calc_on_every_tick parity: this WS message is also the first
-            # update of the NEW forming bar. on_bar_close() above may have opened
-            # a position, so immediately seed the monitor with the new bar's
-            # OHLC/close instead of waiting for the next WS message.
+            # EXIT-PARITY-FIX-v2: seed OHLC/ATR state only. Do NOT treat the
+            # candlestick close/high as an additional live price event. The
+            # subscribed Delta ticker stream is authoritative for the post-fill
+            # tick sequence and therefore for best_price / trail exits.
             if self.trail_monitor is not None and not BINANCE_SIGNAL_FEED:
-                self.trail_monitor.push_ws_candle(h, l, source="delta", close=c)
-                self._last_delta_tick = c
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.trail_monitor.push_delta_tick(c))
+                self.trail_monitor.push_ws_candle(
+                    h, l, source="delta", close=c, evaluate_extreme=False
+                )
 
         else:
             if not BINANCE_SIGNAL_FEED and not self._df.empty:
@@ -489,18 +490,14 @@ class CandleFeed:
                 self._df.at[idx, "close"]  = c
                 self._df.at[idx, "volume"] = v
 
-            if self.trail_monitor is not None and TRAIL_EXIT_FROM_DELTA_WS and not BINANCE_SIGNAL_FEED:
-                loop = asyncio.get_running_loop()
-                loop.create_task(
-                    self.trail_monitor.on_price_tick(c, source="delta")
-                )
-                self.trail_monitor.push_ws_candle(h, l, source="delta", close=c)
-
             if self.trail_monitor is not None and not BINANCE_SIGNAL_FEED:
-                self._last_delta_tick = c   
-                loop = asyncio.get_running_loop()
-                loop.create_task(
-                    self.trail_monitor.push_delta_tick(c)
+                # EXIT-PARITY-FIX-v2: candlestick messages carry cumulative
+                # high/low for the whole bar. On the entry bar those extrema can
+                # include prices from BEFORE the fill, and scheduling close/high
+                # evaluations independently creates a race. Keep candle data for
+                # ATR/bar-close accounting only; ticker messages drive exits.
+                self.trail_monitor.push_ws_candle(
+                    h, l, source="delta", close=c, evaluate_extreme=False
                 )
 
     async def _poll_rest_once(self) -> None:
@@ -550,6 +547,7 @@ class CandleFeed:
                                 BINANCE_SIGNAL_FEED and self._binance_exchange is not None
                             ) else "delta",
                             close = float(cb[4]),
+                            evaluate_extreme = False,
                         )
                 except Exception as e:
                     logger.warning(f"[FEED] FIX-PEAK-REST (REST path) failed: {e}")
@@ -594,10 +592,16 @@ class CandleFeed:
                 self._df.at[idx, "volume"] = float(live_bar[5])
 
             if self.trail_monitor is not None and not BINANCE_SIGNAL_FEED:
+                live_close = float(live_bar[4])
                 self.trail_monitor.push_ws_candle(
                     float(live_bar[2]), float(live_bar[3]),
-                    source="delta", close=float(live_bar[4]),
+                    source="delta", close=live_close,
+                    evaluate_extreme=False,
                 )
+                # WebSocket is unavailable in this branch, so REST close is the
+                # best available current-price fallback. Process it once.
+                self._last_delta_tick = live_close
+                await self.trail_monitor.push_delta_tick(live_close)
 
     @staticmethod
     def _to_df(ohlcv: list) -> pd.DataFrame:

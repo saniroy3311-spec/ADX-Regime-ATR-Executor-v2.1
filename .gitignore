@@ -1,0 +1,10 @@
+# Only the nested project is tracked; root files are the live runtime copy.
+/*
+!/.gitignore
+!/ADX-Regime-ATR-Executor-v2.1/
+# Never commit secrets or runtime data
+.env
+.env.*
+*.db
+__pycache__/
+.venv/

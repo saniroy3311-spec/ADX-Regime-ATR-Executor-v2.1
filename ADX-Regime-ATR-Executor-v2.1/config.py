@@ -126,6 +126,21 @@ DYNAMIC_REALTIME_ATR = _b("DYNAMIC_REALTIME_ATR", not SNIPER_V6_EXIT_PARITY)
 # which already reserves 100% of the position, so they normally never fill.
 BREAKEVEN_ENABLED = _b("BREAKEVEN_ENABLED", True)
 
+# ── TV BAR-PATH TRAIL (Pine "List of Trades" exit parity) ─────────────────
+# TradingView's broker emulator never sees real ticks inside a historical
+# bar. It walks each bar as straight lines:
+#     open -> high -> low -> close   (if the high is nearer the open)
+#     open -> low  -> high -> close  (otherwise)
+# and moves the native trail only along that path. Intrabar dips between
+# the low and the high are invisible to it.
+# When true, the bot copies that model:
+#   * live ticks only test the FROZEN stop / TP set at the last bar close
+#     (no intrabar best-price ratchet, no intrabar arming);
+#   * at every bar close the bar's O/H/L/C is replayed on TV's path to arm
+#     / ratchet the trail, and to detect a same-bar trail exit (filled at
+#     market = bar close, the earliest moment it can be known).
+TRAIL_TV_BAR_PATH = _b("TRAIL_TV_BAR_PATH", False)
+
 TRAIL_STAGE_UPDATE_MODE = os.environ.get("TRAIL_STAGE_UPDATE_MODE", "tick").strip().lower()
 BREAKEVEN_UPDATE_MODE = os.environ.get("BREAKEVEN_UPDATE_MODE", "tick").strip().lower()
 MAX_SL_EVAL_MODE = os.environ.get("MAX_SL_EVAL_MODE", "tick").strip().lower()

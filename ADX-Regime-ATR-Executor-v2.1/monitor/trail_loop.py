@@ -49,6 +49,7 @@ from config import (
     SNIPER_V6_EXIT_PARITY,
     DYNAMIC_REALTIME_ATR,
     BREAKEVEN_ENABLED,
+    TRAIL_TV_BAR_PATH,
 )
 from risk.calculator import RiskLevels, TrailState
 
@@ -189,6 +190,16 @@ def _hard_tp_enabled(risk: RiskLevels) -> bool:
     if not TP_HARD_EXIT:
         return False
     return TREND_HARD_TP_ENABLED if risk.is_trend else RANGE_HARD_TP_ENABLED
+
+def _tv_bar_path(o: float, h: float, l: float, c: float) -> list:
+    """TradingView broker-emulator intrabar path (Default detalization).
+
+    If the high is nearer the open than the low: open -> high -> low -> close,
+    otherwise open -> low -> high -> close.
+    """
+    if (h - o) < (o - l):
+        return [o, h, l, c]
+    return [o, l, h, c]
 
 # ─── TrailMonitor ──────────────────────────────────────────────────────────────
 class TrailMonitor:
@@ -403,6 +414,7 @@ class TrailMonitor:
             f"dynamic_realtime_atr={DYNAMIC_REALTIME_ATR}  "
             f"sniper_v6_exit_parity={SNIPER_V6_EXIT_PARITY}  "
             f"breakeven_enabled={BREAKEVEN_ENABLED}  "
+            f"tv_bar_path={TRAIL_TV_BAR_PATH}  "
             f"stage0_native_trail={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
             f"activation_pts={_trail_pts(1, risk_levels.atr):.2f}  "
             f"trail_off={_trail_off(1, risk_levels.atr):.2f}  "
@@ -462,6 +474,24 @@ class TrailMonitor:
             if bar_open  > 0.0:
                 bar_open = bar_open - self._source_offset
 
+        # ── 0. TV bar-path replay (uses the ATR / stage / stop that were in
+        #       force DURING this bar, i.e. before they are updated below) ──
+        if TRAIL_TV_BAR_PATH:
+            o = bar_open if bar_open > 0.0 else bar_close
+            hit = self._tv_bar_path_replay(o, bar_high, bar_low, bar_close)
+            if hit is not None:
+                tv_level, reason = hit
+                logger.info(
+                    f"[TRAIL] TV bar-path exit inside closed bar | reason={reason} "
+                    f"tv_level={tv_level:.2f} market_close={bar_close:.2f} "
+                    f"diff={(bar_close - tv_level) * (1 if is_long else -1):+.2f} "
+                    f"O={o:.2f} H={bar_high:.2f} L={bar_low:.2f} C={bar_close:.2f}"
+                )
+                asyncio.get_running_loop().create_task(
+                    self._fire_exit(bar_close, reason, source="tv_bar_path")
+                )
+                return
+
         # ── 1. Confirm ATR and start a fresh realtime-bar ATR baseline ──────
         # Pine ta.atr() is a Wilder RMA. At a realtime bar close, `current_atr`
         # is the final ATR for that bar. It becomes the previous confirmed RMA
@@ -515,7 +545,20 @@ class TrailMonitor:
         # is_entry_bar=True: skip — bar prices pre-date the fill in Pine's model
         bar_extreme = bar_high if is_long  else bar_low
 
-        if not is_entry_bar:
+        if TRAIL_TV_BAR_PATH:
+            # Replay already armed the trail / advanced best_price. Re-apply
+            # the trail with the NEW closed-bar ATR (tighten-only), exactly
+            # like the modified strategy.exit() at this close.
+            if getattr(state, 'trail_armed', False):
+                order_stage = state.stage if state.stage > 0 else 1
+                new_trail_sl = _trail_sl_from_best(state.best_price, order_stage, atr, is_long)
+                self._apply_trail_sl(state, risk, new_trail_sl, is_long, source="tv_bar_close")
+                logger.info(
+                    f"[TRAIL] TV bar-path frozen stop for next bar | stage={state.stage} "
+                    f"best={state.best_price:.2f} trail_sl={state.current_sl:.2f} "
+                    f"off={_trail_off(order_stage, atr):.2f} atr={atr:.2f}"
+                )
+        elif not is_entry_bar:
             if getattr(state, 'trail_armed', False):
                 # Advance best_price from bar extreme (intrabar wick is real)
                 self._update_best_price(state, bar_extreme, is_long)
@@ -970,6 +1013,10 @@ class TrailMonitor:
             gap_fill = True
             self._gap_fill_next_tick = False
 
+        if TRAIL_TV_BAR_PATH:
+            await self._evaluate_tick_tv_frozen(price, source, gap_fill)
+            return
+
         # ── 0. Optional live-tick state updates ───────────────────────────────
         # Protective stop/TP/trail checks remain live. Strict parity defaults
         # stage/BE updates to tick mode, matching calc_on_every_tick=true.
@@ -1204,6 +1251,104 @@ class TrailMonitor:
             if int(time.time() * 1000)  >= self._entry_bar_end_ms:
                 await self._fire_exit(price, "Time exit (bar close)", source="tick")
 
+    # ── TV bar-path mode ──────────────────────────────────────────────────────
+    async def _evaluate_tick_tv_frozen(self, price: float, source: str, gap_fill: bool) -> None:
+        """Live tick in TV bar-path mode.
+
+        Only the levels frozen at the last bar close are tested: hard TP and
+        the protective stop (initial SL or trail). best_price, arming and the
+        trail level are NOT moved by ticks — TradingView's historical engine
+        never sees intrabar wiggles, so neither do we.
+        """
+        risk, state = self._risk, self._state
+        is_long = risk.is_long
+
+        if _hard_tp_enabled(risk) and self._static_orders_active:
+            tp_level = self._dynamic_tp if self._dynamic_tp > 0 else risk.tp
+            if (price >= tp_level) if is_long else (price <= tp_level):
+                await self._fire_exit(price if gap_fill else tp_level, "TP", source="tick")
+                return
+
+        armed = getattr(state, "trail_armed", False)
+        if not (self._static_orders_active or armed):
+            return  # Sniper v6 entry candle: no SL/TP, trail decided at close
+
+        if self._sl_confirmed(price, state.current_sl, is_long, source=source, trail_armed=armed):
+            improved = (state.current_sl > risk.sl) if is_long else (state.current_sl < risk.sl)
+            if armed and improved:
+                reason = f"Trail SL (stage {max(state.stage, 1)})"
+            else:
+                reason = "Initial SL"
+            await self._fire_exit(price if gap_fill else state.current_sl, reason, source="tick")
+
+    def _tv_bar_path_replay(self, o: float, h: float, l: float, c: float):
+        """Replay one closed bar the way TradingView's broker emulator does.
+
+        Uses the stop / TP / trail parameters that were live during the bar.
+        Returns (tv_exit_level, reason) if TradingView would have exited
+        inside this bar, else None (and persists arm / best_price).
+        """
+        risk, state = self._risk, self._state
+        is_long = risk.is_long
+        s = 1.0 if is_long else -1.0
+        F = lambda p: s * p  # favourable-direction value
+
+        atr = self._current_atr if self._current_atr > 0 else risk.atr
+        order_stage = state.stage if state.stage > 0 else (1 if TRAIL_LEGACY_TV_TICK_SEMANTICS else 0)
+        if order_stage <= 0:
+            return None
+        off = _trail_off(order_stage, atr)
+        act = _activation_price(risk.entry_price, order_stage, atr, is_long)
+
+        armed = bool(getattr(state, "trail_armed", False))
+        best = state.best_price
+        stop = state.current_sl if (self._static_orders_active or armed) else None
+        tp = None
+        if _hard_tp_enabled(risk) and self._static_orders_active:
+            tp = self._dynamic_tp if self._dynamic_tp > 0 else risk.tp
+
+        def stop_reason(level):
+            improved = F(level) > F(risk.sl)
+            return f"Trail SL (stage {max(state.stage, 1)})" if (armed and improved) else "Initial SL"
+
+        path = _tv_bar_path(o, h, l, c)  # same path rule for longs and shorts
+
+        # gap at the open
+        if stop is not None and F(o) <= F(stop):
+            return (o, stop_reason(stop))
+        if tp is not None and F(o) >= F(tp):
+            return (o, "TP")
+
+        prev = o
+        for p in path[1:]:
+            if F(p) > F(prev):            # favourable leg
+                if tp is not None and F(p) >= F(tp):
+                    return (tp, "TP")
+                if not armed and F(p) >= F(act):
+                    armed, best = True, p
+                elif armed and F(p) > F(best):
+                    best = p
+                if armed:
+                    cand = best - s * off
+                    if stop is None or F(cand) > F(stop):
+                        stop = cand
+            elif F(p) < F(prev):          # adverse leg
+                if stop is not None and F(p) <= F(stop):
+                    return (stop, stop_reason(stop))
+            prev = p
+
+        if armed and not state.trail_armed:
+            self._trail_ever_armed = True
+            logger.info(
+                f"[TRAIL] TV bar-path trail ARMED in closed bar | best={best:.2f} "
+                f"act_price={act:.2f} off={off:.2f} atr={atr:.2f}"
+            )
+        state.trail_armed = armed
+        if armed:
+            state.best_price = best
+            self._apply_trail_sl(state, risk, best - s * off, is_long, source="tv_bar_path")
+        return None
+
     # ── Trail helpers ──────────────────────────────────────────────────────────
     def _update_best_price(self, state: TrailState, price: float, is_long: bool) -> None:
         """Update best_price — highest for long, lowest for short."""
@@ -1322,6 +1467,9 @@ class TrailMonitor:
             and self._entry_bar_end_ms > 0
             and int(time.time() * 1000) < self._entry_bar_end_ms
         ):
+            evaluate_extreme = False
+
+        if TRAIL_TV_BAR_PATH:
             evaluate_extreme = False
 
         if not evaluate_extreme:

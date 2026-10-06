@@ -82,6 +82,18 @@ logger = logging.getLogger("main")
 
 MAX_ENTRY_SLIP_ATR_FRAC = float(os.environ.get("MAX_ENTRY_SLIP_ATR_FRAC", "0.3"))
 
+# A bar-close signal is only valid if it is evaluated right after the bar
+# closed. On restart, the feed re-reports the last already-closed bar when the
+# first websocket candle of the forming bar arrives (often many minutes late).
+# Pine never enters that late, so skip ENTRY evaluation for such stale bars.
+STALE_BAR_MAX_SEC = float(os.environ.get("STALE_BAR_MAX_SEC", "90"))
+
+
+def _timeframe_ms(tf: str) -> int:
+    tf = str(tf).strip().lower()
+    units = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    return int(tf[:-1]) * units[tf[-1]]
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ADXRegimeATRExecutor
 # ══════════════════════════════════════════════════════════════════════════════
@@ -391,6 +403,21 @@ class ADXRegimeATRExecutor:
             return
 
         # ── 3. Evaluate entry signals (only when flat) ────────────────────────
+        # Stale-bar guard: never open a trade from a bar that closed long ago
+        # (restart artifact). Pine only enters on a fresh confirmed close.
+        try:
+            bar_end_ms = int(snap.timestamp) + _timeframe_ms(CANDLE_TIMEFRAME)
+            lag_sec = (time.time() * 1000 - bar_end_ms) / 1000.0
+        except Exception:
+            lag_sec = 0.0
+        if snap.timestamp and lag_sec > STALE_BAR_MAX_SEC:
+            logger.warning(
+                f"[BAR] Stale bar-close ignored for ENTRY | bar closed "
+                f"{lag_sec:.0f}s ago (> {STALE_BAR_MAX_SEC:.0f}s) — restart artifact, "
+                f"Pine would not enter now"
+            )
+            return
+
         sig = evaluate(snap, has_position=False)
 
         if sig.signal_type == SignalType.NONE:

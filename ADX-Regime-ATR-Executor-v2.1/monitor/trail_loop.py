@@ -50,6 +50,7 @@ from config import (
     DYNAMIC_REALTIME_ATR,
     BREAKEVEN_ENABLED,
     TRAIL_TV_BAR_PATH,
+    TRAIL_TV_ENTRY_CANDLE_LIVE,
 )
 from risk.calculator import RiskLevels, TrailState
 
@@ -415,6 +416,7 @@ class TrailMonitor:
             f"sniper_v6_exit_parity={SNIPER_V6_EXIT_PARITY}  "
             f"breakeven_enabled={BREAKEVEN_ENABLED}  "
             f"tv_bar_path={TRAIL_TV_BAR_PATH}  "
+            f"tv_entry_candle_live={TRAIL_TV_ENTRY_CANDLE_LIVE}  "
             f"stage0_native_trail={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
             f"activation_pts={_trail_pts(1, risk_levels.atr):.2f}  "
             f"trail_off={_trail_off(1, risk_levels.atr):.2f}  "
@@ -476,7 +478,12 @@ class TrailMonitor:
 
         # ── 0. TV bar-path replay (uses the ATR / stage / stop that were in
         #       force DURING this bar, i.e. before they are updated below) ──
-        if TRAIL_TV_BAR_PATH:
+        if TRAIL_TV_BAR_PATH and not self._tv_frozen_active():
+            logger.info(
+                "[TRAIL] TV bar-path: entry candle was managed on live ticks "
+                "- no replay for this bar"
+            )
+        if self._tv_frozen_active():
             o = bar_open if bar_open > 0.0 else bar_close
             hit = self._tv_bar_path_replay(o, bar_high, bar_low, bar_close)
             if hit is not None:
@@ -1013,7 +1020,7 @@ class TrailMonitor:
             gap_fill = True
             self._gap_fill_next_tick = False
 
-        if TRAIL_TV_BAR_PATH:
+        if self._tv_frozen_active():
             await self._evaluate_tick_tv_frozen(price, source, gap_fill)
             return
 
@@ -1252,6 +1259,18 @@ class TrailMonitor:
                 await self._fire_exit(price, "Time exit (bar close)", source="tick")
 
     # ── TV bar-path mode ──────────────────────────────────────────────────────
+    def _tv_frozen_active(self) -> bool:
+        """True when TV candle mode applies to the current candle.
+
+        With TRAIL_TV_ENTRY_CANDLE_LIVE the entry candle (static orders not
+        yet active) is handled by the live tick evaluator instead.
+        """
+        if not TRAIL_TV_BAR_PATH:
+            return False
+        if TRAIL_TV_ENTRY_CANDLE_LIVE and not getattr(self, "_static_orders_active", True):
+            return False
+        return True
+
     async def _evaluate_tick_tv_frozen(self, price: float, source: str, gap_fill: bool) -> None:
         """Live tick in TV bar-path mode.
 

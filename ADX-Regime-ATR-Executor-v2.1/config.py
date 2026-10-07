@@ -140,6 +140,10 @@ BREAKEVEN_ENABLED = _b("BREAKEVEN_ENABLED", True)
 #     / ratchet the trail, and to detect a same-bar trail exit (filled at
 #     market = bar close, the earliest moment it can be known).
 TRAIL_TV_BAR_PATH = _b("TRAIL_TV_BAR_PATH", False)
+# Only used with TRAIL_TV_BAR_PATH=true. When true, the ENTRY candle is
+# managed on live ticks (trail can arm and exit inside the running entry
+# candle); TV candle mode starts from the first candle close.
+TRAIL_TV_ENTRY_CANDLE_LIVE = _b("TRAIL_TV_ENTRY_CANDLE_LIVE", False)
 
 TRAIL_STAGE_UPDATE_MODE = os.environ.get("TRAIL_STAGE_UPDATE_MODE", "tick").strip().lower()
 BREAKEVEN_UPDATE_MODE = os.environ.get("BREAKEVEN_UPDATE_MODE", "tick").strip().lower()

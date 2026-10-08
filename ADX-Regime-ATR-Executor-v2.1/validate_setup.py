@@ -1,86 +1,111 @@
-"""Pre-flight validation for ADX Regime ATR Executor v2.1."""
+"""Pre-flight validation for the uploaded BTCUSDT Sniper v6 Pine profile."""
 from __future__ import annotations
 import config
 
 EXPECTED = {
-    "EMA_FAST_LEN": 20, "EMA_TREND_LEN": 50,
-    "ATR_LEN": 14, "DI_LEN": 14, "ADX_SMOOTH": 14, "ADX_EMA": 5, "RSI_LEN": 14,
-    "ADX_TREND_TH": 22.0, "ADX_RANGE_TH": 18.0,
-    "FILTER_ATR_MULT": 1.4, "FILTER_BODY_MULT": 0.5,
-    "TREND_RR": 4.0, "RANGE_RR": 2.5,
-    "TREND_ATR_MULT": 0.6, "RANGE_ATR_MULT": 0.5,
-    "MAX_SL_MULT": 1.5, "MAX_SL_POINTS": 500.0, "BE_MULT": 0.6,
+    "EMA_FAST_LEN": 20,
+    "EMA_TREND_LEN": 50,
+    "ATR_LEN": 14,
+    "DI_LEN": 14,
+    "ADX_SMOOTH": 14,
+    "ADX_EMA": 5,
+    "RSI_LEN": 14,
+    "ADX_TREND_TH": 15.0,
+    "ADX_RANGE_TH": 14.0,
+    "FILTER_ATR_MULT": 1.5,
+    "FILTER_BODY_MULT": 0.1,
+    "TREND_RR": 5.3,
+    "RANGE_RR": 2.3,
+    "TREND_ATR_MULT": 1.2,
+    "RANGE_ATR_MULT": 0.8,
+    "MAX_SL_MULT": 1.8,
+    "MAX_SL_POINTS": 350.0,
+    "BE_MULT": 0.6,
+    "RSI_OB": 70,
+    "RSI_OS": 20,
 }
 EXPECTED_STAGES = [
-    (0.8, 0.50, 0.40), (1.5, 0.40, 0.30), (2.5, 0.30, 0.25),
-    (4.0, 0.20, 0.15), (6.0, 0.15, 0.10),
+    (1.1, 0.10, 0.50),
+    (0.6, 0.10, 0.50),
+    (2.3, 0.20, 0.35),
+    (4.1, 0.20, 0.15),
+    (6.0, 0.15, 0.10),
 ]
 
 
 def main() -> int:
-    errors = []
-    warnings = []
-    for key, value in EXPECTED.items():
-        if getattr(config, key) != value:
-            errors.append(f"{key}={getattr(config, key)!r}; active Pine profile requires {value!r}")
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if config.PINE_PROFILE != "sniper_v6_exact":
+        errors.append(f"PINE_PROFILE={config.PINE_PROFILE!r}; expected 'sniper_v6_exact'")
+
+    for key, expected in EXPECTED.items():
+        actual = getattr(config, key)
+        if actual != expected:
+            errors.append(f"{key}={actual!r}; TradingView screenshot requires {expected!r}")
+
     if config.TRAIL_STAGES != EXPECTED_STAGES:
-        errors.append(f"TRAIL_STAGES={config.TRAIL_STAGES!r}; active Pine profile requires {EXPECTED_STAGES!r}")
-    if config.BREAKOUT_BUFFER_PTS != 0:
-        errors.append("BREAKOUT_BUFFER_PTS must be 0 for strict Pine signal parity")
-    if config.ADX_TOLERANCE != 0:
-        errors.append("ADX_TOLERANCE must be 0 for strict Pine signal parity")
-    if config.FILTER_BODY_TOLERANCE != 0:
-        errors.append("FILTER_BODY_TOLERANCE must be 0 for strict Pine signal parity")
-    if not config.FILTER_VOL_ENABLED or config.FILTER_VOL_MULT != 1.0:
-        errors.append("Volume filter must be enabled at 1.0x for the supplied Pine profile")
-    if not config.TP_HARD_EXIT:
-        errors.append("TP_HARD_EXIT must be true")
-    if config.BAR_CLOSE_SL_EVAL:
-        errors.append("BAR_CLOSE_SL_EVAL must be false for live-tick protection")
+        errors.append(f"TRAIL_STAGES={config.TRAIL_STAGES!r}; expected {EXPECTED_STAGES!r}")
+
+    if not config.PINE_PARITY_MODE:
+        errors.append("PINE_PARITY_MODE must be true")
     if not config.LIVE_TICK_RISK_ENGINE:
-        errors.append("LIVE_TICK_RISK_ENGINE must be true")
+        errors.append("LIVE_TICK_RISK_ENGINE must be true (Pine calc_on_every_tick=true)")
+    if not config.TRAIL_LEGACY_TV_TICK_SEMANTICS:
+        errors.append("Native Pine strategy.exit trail requires tick semantics")
+    if not config.DYNAMIC_REALTIME_ATR:
+        errors.append("DYNAMIC_REALTIME_ATR must be true (ta.atr recalculates on realtime ticks)")
+    if not config.PINE_REALTIME_VAR_ROLLBACK:
+        errors.append("PINE_REALTIME_VAR_ROLLBACK must be true (`trailStage` uses var, not varip)")
     if config.TRAIL_STAGE_UPDATE_MODE != "tick":
-        errors.append("TRAIL_STAGE_UPDATE_MODE must be tick for v2.1 realtime parity")
-    if config.BREAKEVEN_UPDATE_MODE != "tick":
-        errors.append("BREAKEVEN_UPDATE_MODE must be tick for v2.1 realtime parity")
+        errors.append("TRAIL_STAGE_UPDATE_MODE must be tick")
     if config.MAX_SL_EVAL_MODE != "tick":
-        errors.append("MAX_SL_EVAL_MODE must be tick for v2.1 realtime parity")
-    if config.TRAIL_LEGACY_TV_TICK_SEMANTICS:
-        errors.append("TRAIL_LEGACY_TV_TICK_SEMANTICS must be false; it reproduces the old unit bug")
+        errors.append("MAX_SL_EVAL_MODE must be tick")
+    if config.BREAKEVEN_ENABLED:
+        errors.append("BREAKEVEN_ENABLED must be false: primary strategy.exit reserves the position before BE exits")
+    if config.TRAIL_TV_BAR_PATH:
+        errors.append("TRAIL_TV_BAR_PATH must be false for live Pine parity")
+    if config.SNIPER_V6_EXIT_PARITY:
+        errors.append("SNIPER_V6_EXIT_PARITY must be false for this calc_on_every_tick Pine")
+    if config.BAR_CLOSE_SL_EVAL:
+        errors.append("BAR_CLOSE_SL_EVAL must be false")
+    if config.TRAIL_SL_PRE_FIRE_BUFFER != 0:
+        errors.append("TRAIL_SL_PRE_FIRE_BUFFER must be 0")
+    if config.SL_CONFIRM_TICKS != 1 or config.TRAIL_SL_CONFIRM_TICKS != 1:
+        errors.append("SL_CONFIRM_TICKS and TRAIL_SL_CONFIRM_TICKS must both be 1")
+    if config.BREAKOUT_BUFFER_PTS != 0 or config.ADX_TOLERANCE != 0 or config.FILTER_BODY_TOLERANCE != 0:
+        errors.append("Parity tolerances/buffers must be zero")
+
+    expected_source = "binance" if config.BINANCE_SIGNAL_FEED else "delta"
+    if config.PINE_TRAIL_PRICE_SOURCE != expected_source:
+        errors.append(
+            f"PINE_TRAIL_PRICE_SOURCE={config.PINE_TRAIL_PRICE_SOURCE}; must match signal feed {expected_source}"
+        )
+
     if config.PINE_MINTICK <= 0:
-        errors.append("PINE_MINTICK must be > 0 and match the TradingView symbol")
-    if config.PINE_POINT_VALUE <= 0:
-        errors.append("PINE_POINT_VALUE must be > 0 for backtest accounting")
-    if config.ALERT_QTY <= 0:
-        errors.append("ALERT_QTY must be > 0")
+        errors.append("PINE_MINTICK must match syminfo.mintick on the TradingView chart")
 
-    placeholder_key = config.DELTA_API_KEY.startswith(("YOUR_", "PASTE_"))
-    placeholder_secret = config.DELTA_API_SECRET.startswith(("YOUR_", "PASTE_"))
-    if placeholder_key or placeholder_secret:
+    if config.DELTA_API_KEY.startswith(("YOUR_", "PASTE_")) or config.DELTA_API_SECRET.startswith(("YOUR_", "PASTE_")):
         warnings.append("Delta API credentials are placeholders")
-    if config.EXECUTION_MODE == "live" and (not config.DELTA_TESTNET) and (not config.LIVE_TRADING_ENABLED):
-        errors.append("Production live mode is locked: set LIVE_TRADING_ENABLED=true deliberately")
     if config.EXECUTION_MODE == "paper":
-        warnings.append("EXECUTION_MODE=paper: no exchange orders will be sent")
-    elif not config.DELTA_TESTNET:
-        warnings.append("PRODUCTION LIVE MODE: real orders can be placed")
-    if config.GSHEET_ENABLED and not config.GSHEET_SPREADSHEET_ID:
-        warnings.append("GSHEET_ENABLED=true but GSHEET_SPREADSHEET_ID is empty")
-    if config.EMERGENCY_BRACKET_ENABLED:
-        warnings.append("Emergency exchange bracket is enabled as disconnect/crash protection")
+        warnings.append("EXECUTION_MODE=paper: no live exchange orders will be sent")
+    if config.EXECUTION_MODE == "live" and not config.DELTA_TESTNET and not config.LIVE_TRADING_ENABLED:
+        errors.append("Production live routing is locked; LIVE_TRADING_ENABLED=true is required")
 
-    print(f"{config.BOT_NAME} {config.BOT_VERSION}")
-    print(f"EMA {config.EMA_FAST_LEN}/{config.EMA_TREND_LEN} | timeframe {config.CANDLE_TIMEFRAME}")
-    print(f"signal feed={'Binance' if config.BINANCE_SIGNAL_FEED else 'Delta'} | mintick={config.PINE_MINTICK}")
-    print(f"risk updates stage/BE/maxSL={config.TRAIL_STAGE_UPDATE_MODE}/{config.BREAKEVEN_UPDATE_MODE}/{config.MAX_SL_EVAL_MODE}")
-    print(f"execution={config.EXECUTION_MODE.upper()} | delta={'TESTNET' if config.DELTA_TESTNET else 'PRODUCTION'} | live_switch={config.LIVE_TRADING_ENABLED}")
-    for warning in warnings:
-        print(f"WARNING: {warning}")
-    for error in errors:
-        print(f"ERROR: {error}")
+    print(f"profile={config.PINE_PROFILE}")
+    print(f"EMA={config.EMA_FAST_LEN}/{config.EMA_TREND_LEN} timeframe={config.CANDLE_TIMEFRAME}")
+    print(f"feed={expected_source} trail_source={config.PINE_TRAIL_PRICE_SOURCE} mintick={config.PINE_MINTICK}")
+    print(f"dynamic_atr={config.DYNAMIC_REALTIME_ATR} native_tick_trail={config.TRAIL_LEGACY_TV_TICK_SEMANTICS}")
+    print(f"rollback_stage={config.PINE_REALTIME_VAR_ROLLBACK} BE_effective={config.BREAKEVEN_ENABLED}")
+    print(f"trail_stages={config.TRAIL_STAGES}")
+    for w in warnings:
+        print(f"WARNING: {w}")
+    for e in errors:
+        print(f"ERROR: {e}")
     if errors:
         return 1
-    print("Core ADX Regime ATR Executor v2.1 configuration: OK")
+    print("Sniper v6 exact Pine profile: OK")
     return 0
 
 

@@ -37,6 +37,18 @@ BOT_VERSION = os.environ.get("BOT_VERSION", "2.1.0-parity")
 PINE_PARITY_MODE = _b("PINE_PARITY_MODE", True)
 LIVE_TICK_RISK_ENGINE = _b("LIVE_TICK_RISK_ENGINE", True)
 
+# Exact uploaded Pine v5 profile. The supplied strategy uses calc_on_every_tick=true,
+# native strategy.exit(... trail_points/trail_offset ...), and ordinary `var`
+# state (which is rolled back between realtime ticks until bar close).
+PINE_PROFILE = os.environ.get("PINE_PROFILE", "sniper_v6_exact").strip().lower()
+if PINE_PROFILE != "sniper_v6_exact":
+    raise ValueError("This build is locked to PINE_PROFILE=sniper_v6_exact")
+
+# One price stream must drive Pine-equivalent trail state. `signal` resolves to
+# the same venue used for indicator/entry candles.
+PINE_TRAIL_PRICE_SOURCE = os.environ.get("PINE_TRAIL_PRICE_SOURCE", "signal").strip().lower()
+TRAIL_TRACE = _b("TRAIL_TRACE", False)
+
 # Execution mode
 #   paper = use the configured Delta environment for market/account connectivity,
 #           but NEVER send or cancel exchange orders. Orders/fills are simulated.
@@ -80,69 +92,49 @@ ADX_EMA = _i("ADX_EMA", 5)
 RSI_LEN = _i("RSI_LEN", 14)
 
 # Exact Pine thresholds
-ADX_TREND_TH = _f("ADX_TREND_TH", 22.0)
-ADX_RANGE_TH = _f("ADX_RANGE_TH", 18.0)
+ADX_TREND_TH = _f("ADX_TREND_TH", 15.0)
+ADX_RANGE_TH = _f("ADX_RANGE_TH", 14.0)
 ADX_TOLERANCE = _f("ADX_TOLERANCE", 0.0)
-FILTER_ATR_MULT = _f("FILTER_ATR_MULT", 1.4)
-FILTER_BODY_MULT = _f("FILTER_BODY_MULT", 0.5)
+FILTER_ATR_MULT = _f("FILTER_ATR_MULT", 1.5)
+FILTER_BODY_MULT = _f("FILTER_BODY_MULT", 0.1)
 FILTER_BODY_TOLERANCE = _f("FILTER_BODY_TOLERANCE", 0.0)
 FILTER_VOL_ENABLED = _b("FILTER_VOL_ENABLED", True)
 FILTER_VOL_MULT = _f("FILTER_VOL_MULT", 1.0)
 BREAKOUT_BUFFER_PTS = _f("BREAKOUT_BUFFER_PTS", 0.0)
 RSI_OB = _i("RSI_OB", 70)
-RSI_OS = _i("RSI_OS", 30)
+RSI_OS = _i("RSI_OS", 20)
 
 # Exact Pine risk / reward
-TREND_RR = _f("TREND_RR", 4.0)
-RANGE_RR = _f("RANGE_RR", 2.5)
-TREND_ATR_MULT = _f("TREND_ATR_MULT", 0.6)
-RANGE_ATR_MULT = _f("RANGE_ATR_MULT", 0.5)
-MAX_SL_MULT = _f("MAX_SL_MULT", 1.5)
-MAX_SL_POINTS = _f("MAX_SL_POINTS", 500.0)
+TREND_RR = _f("TREND_RR", 5.3)
+RANGE_RR = _f("RANGE_RR", 2.3)
+TREND_ATR_MULT = _f("TREND_ATR_MULT", 1.2)
+RANGE_ATR_MULT = _f("RANGE_ATR_MULT", 0.8)
+MAX_SL_MULT = _f("MAX_SL_MULT", 1.8)
+MAX_SL_POINTS = _f("MAX_SL_POINTS", 350.0)
 BE_MULT = _f("BE_MULT", 0.6)
 
-# (stage trigger ATR, trail_points ATR multiplier, trail_offset ATR multiplier)
-# Corrected semantics:
-# - There is NO trail while stage == 0.
-# - A stage unlocks only after profit reaches trigger * ENTRY_ATR.
-# - Once unlocked, the TradingView-style trail activation distance is
-#   trail_points * ENTRY_ATR and the trail gap is trail_offset * ENTRY_ATR.
-# - All distances are PRICE units in Python and in the matching custom Pine
-#   trail state machine. They are NOT passed as native trail_points/ticks.
-# - ENTRY_ATR is frozen at the signal/entry, so risk does not drift mid-trade.
-# Legacy mode is retained only for regression comparison with the old script bug.
-TRAIL_LEGACY_TV_TICK_SEMANTICS = _b("TRAIL_LEGACY_TV_TICK_SEMANTICS", False)
-# ── SNIPER v6 EXIT PARITY ────────────────────────────────────────────────
-# Copies how "BTCUSDT Sniper v6" really exits on TradingView when
-# Script execution = "On bar close":
-#   * ATR only changes when a 30m candle closes (no live intrabar ATR)
-#   * NO initial SL / TP during the entry candle (only the native trail)
-#   * Max-SL is also checked at the close of the entry candle
-#   * the first price after a candle close that is already beyond a level
-#     that just moved is filled at that price (TradingView fills at bar open)
-SNIPER_V6_EXIT_PARITY = _b("SNIPER_V6_EXIT_PARITY", False)
-DYNAMIC_REALTIME_ATR = _b("DYNAMIC_REALTIME_ATR", not SNIPER_V6_EXIT_PARITY)
-# In Sniper v6 the BE-* strategy.exit orders sit behind the main exit order,
-# which already reserves 100% of the position, so they normally never fill.
-BREAKEVEN_ENABLED = _b("BREAKEVEN_ENABLED", True)
+# Native Pine trailing configuration. The uploaded Pine passes
+#   activePts = atr * stagePts
+#   activeOff = atr * stageOff
+# directly to strategy.exit(trail_points=..., trail_offset=...). TradingView
+# interprets both arguments as TICK counts, so Python converts to price distance
+# with PINE_MINTICK. Stage 0 still submits the Stage-1 values because of the
+# Pine ternary fall-through.
+TRAIL_LEGACY_TV_TICK_SEMANTICS = _b("TRAIL_LEGACY_TV_TICK_SEMANTICS", True)
 
-# ── TV BAR-PATH TRAIL (Pine "List of Trades" exit parity) ─────────────────
-# TradingView's broker emulator never sees real ticks inside a historical
-# bar. It walks each bar as straight lines:
-#     open -> high -> low -> close   (if the high is nearer the open)
-#     open -> low  -> high -> close  (otherwise)
-# and moves the native trail only along that path. Intrabar dips between
-# the low and the high are invisible to it.
-# When true, the bot copies that model:
-#   * live ticks only test the FROZEN stop / TP set at the last bar close
-#     (no intrabar best-price ratchet, no intrabar arming);
-#   * at every bar close the bar's O/H/L/C is replayed on TV's path to arm
-#     / ratchet the trail, and to detect a same-bar trail exit (filled at
-#     market = bar close, the earliest moment it can be known).
+# This older compatibility flag modeled a different bar-close-only experiment.
+# It must remain false for the supplied Pine, which has calc_on_every_tick=true.
+SNIPER_V6_EXIT_PARITY = _b("SNIPER_V6_EXIT_PARITY", False)
+DYNAMIC_REALTIME_ATR = _b("DYNAMIC_REALTIME_ATR", True)
+
+# The Pine places the primary strategy.exit before the BE strategy.exit calls.
+# That first exit reserves the full position in the default OCA reduce group, so
+# the later BE exit calls do not own executable quantity. Keep BE informational
+# behavior disabled in Python for order-level parity.
+BREAKEVEN_ENABLED = _b("BREAKEVEN_ENABLED", False)
+
+# Historical OHLC bar-path replay is not the live Pine model.
 TRAIL_TV_BAR_PATH = _b("TRAIL_TV_BAR_PATH", False)
-# Only used with TRAIL_TV_BAR_PATH=true. When true, the ENTRY candle is
-# managed on live ticks (trail can arm and exit inside the running entry
-# candle); TV candle mode starts from the first candle close.
 TRAIL_TV_ENTRY_CANDLE_LIVE = _b("TRAIL_TV_ENTRY_CANDLE_LIVE", False)
 
 TRAIL_STAGE_UPDATE_MODE = os.environ.get("TRAIL_STAGE_UPDATE_MODE", "tick").strip().lower()
@@ -155,11 +147,28 @@ if BREAKEVEN_UPDATE_MODE not in {"bar_close", "tick"}:
 if MAX_SL_EVAL_MODE not in {"bar_close", "tick"}:
     raise ValueError("MAX_SL_EVAL_MODE must be bar_close or tick")
 
+# Ordinary Pine `var` values roll back between realtime tick executions.
+PINE_REALTIME_VAR_ROLLBACK = _b("PINE_REALTIME_VAR_ROLLBACK", True)
+
+# Lock this exact profile to the supplied Pine execution semantics.
+if PINE_PROFILE == "sniper_v6_exact":
+    PINE_PARITY_MODE = True
+    LIVE_TICK_RISK_ENGINE = True
+    TRAIL_LEGACY_TV_TICK_SEMANTICS = True
+    SNIPER_V6_EXIT_PARITY = False
+    DYNAMIC_REALTIME_ATR = True
+    BREAKEVEN_ENABLED = False
+    TRAIL_STAGE_UPDATE_MODE = "tick"
+    BREAKEVEN_UPDATE_MODE = "tick"
+    MAX_SL_EVAL_MODE = "tick"
+    TRAIL_TV_BAR_PATH = False
+    TRAIL_TV_ENTRY_CANDLE_LIVE = False
+
 TRAIL_STAGES = [
-    (_f("TRAIL1_TRIGGER", 0.8), _f("TRAIL1_PTS", 0.50), _f("TRAIL1_OFF", 0.40)),
-    (_f("TRAIL2_TRIGGER", 1.5), _f("TRAIL2_PTS", 0.40), _f("TRAIL2_OFF", 0.30)),
-    (_f("TRAIL3_TRIGGER", 2.5), _f("TRAIL3_PTS", 0.30), _f("TRAIL3_OFF", 0.25)),
-    (_f("TRAIL4_TRIGGER", 4.0), _f("TRAIL4_PTS", 0.20), _f("TRAIL4_OFF", 0.15)),
+    (_f("TRAIL1_TRIGGER", 1.1), _f("TRAIL1_PTS", 0.10), _f("TRAIL1_OFF", 0.50)),
+    (_f("TRAIL2_TRIGGER", 0.6), _f("TRAIL2_PTS", 0.10), _f("TRAIL2_OFF", 0.50)),
+    (_f("TRAIL3_TRIGGER", 2.3), _f("TRAIL3_PTS", 0.20), _f("TRAIL3_OFF", 0.35)),
+    (_f("TRAIL4_TRIGGER", 4.1), _f("TRAIL4_PTS", 0.20), _f("TRAIL4_OFF", 0.15)),
     (_f("TRAIL5_TRIGGER", 6.0), _f("TRAIL5_PTS", 0.15), _f("TRAIL5_OFF", 0.10)),
 ]
 
@@ -174,6 +183,17 @@ FEE_MODEL_INCLUDE_GST = _b("FEE_MODEL_INCLUDE_GST", True)
 # BINANCE:BTCUSDT (and set PINE_MINTICK accordingly, commonly 0.1).
 BINANCE_SIGNAL_FEED = _b("BINANCE_SIGNAL_FEED", False)
 BINANCE_SYMBOL = os.environ.get("BINANCE_SYMBOL", "BTC/USDT")
+if PINE_TRAIL_PRICE_SOURCE == "signal":
+    PINE_TRAIL_PRICE_SOURCE = "binance" if BINANCE_SIGNAL_FEED else "delta"
+if PINE_TRAIL_PRICE_SOURCE not in {"binance", "delta"}:
+    raise ValueError("PINE_TRAIL_PRICE_SOURCE must be signal, binance, or delta")
+if PINE_PROFILE == "sniper_v6_exact":
+    _expected_trail_source = "binance" if BINANCE_SIGNAL_FEED else "delta"
+    if PINE_TRAIL_PRICE_SOURCE != _expected_trail_source:
+        raise ValueError(
+            "sniper_v6_exact requires the trail source to match the TradingView/signal feed: "
+            f"expected {_expected_trail_source}, got {PINE_TRAIL_PRICE_SOURCE}"
+        )
 WS_RECONNECT_SEC = _f("WS_RECONNECT_SEC", 5.0)
 TRAIL_LOOP_SEC = _f("TRAIL_LOOP_SEC", 0.25)
 TRAIL_EXIT_FROM_DELTA_WS = _b("TRAIL_EXIT_FROM_DELTA_WS", True)
@@ -198,6 +218,15 @@ TRAIL_ARM_FLOOR_MULT = _f("TRAIL_ARM_FLOOR_MULT", 0.0)
 SL_CONFIRM_MS = _i("SL_CONFIRM_MS", 0)
 SL_CONFIRM_TICKS = _i("SL_CONFIRM_TICKS", 1)
 TRAIL_SL_CONFIRM_TICKS = _i("TRAIL_SL_CONFIRM_TICKS", 1)
+if PINE_PROFILE == "sniper_v6_exact":
+    BAR_CLOSE_SL_EVAL = False
+    TRAIL_SL_PRE_FIRE_BUFFER = 0.0
+    TRAIL_OFFSET_FLOOR_MULT = 0.0
+    TRAIL_ARM_FLOOR_MULT = 0.0
+    SL_CONFIRM_MS = 0
+    SL_CONFIRM_TICKS = 1
+    TRAIL_SL_CONFIRM_TICKS = 1
+    TRAIL_FIRE_SL_ON_CANDLE_EXTREME = False
 MAX_EXIT_SLIPPAGE_ATR_PCT = _f("MAX_EXIT_SLIPPAGE_ATR_PCT", 25.0)
 EMERGENCY_BRACKET_ENABLED = _b("EMERGENCY_BRACKET_ENABLED", True)
 BRACKET_SL_WIDEN_MULT = _f("BRACKET_SL_WIDEN_MULT", 1.0)

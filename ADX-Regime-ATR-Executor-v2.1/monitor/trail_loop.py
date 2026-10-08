@@ -9,8 +9,8 @@ Key parity rules:
 - ATR is recalculated from the live forming candle using Pine/Wilder RMA semantics.
 - Stage thresholds, breakeven, max-SL checks and trail movement run on live ticks
   by default (configurable to bar-close compatibility where supported).
-- Stage 0 has no trailing stop. A stage must unlock before the trail can arm.
-- Trail activation and offset are ATR price distances, not native Pine tick counts.
+- The uploaded Sniper v6 always submits a native trail; stage 0 uses Stage-1 trail values.
+- Native trail_points/trail_offset are tick counts, so ATR-derived values are multiplied by syminfo.mintick in price space.
 - best_price is a running favorable extreme and never resets on a stage upgrade.
 - current_sl can only tighten; it never moves away from price.
 - The exchange-side bracket is crash/disconnect protection; the Python engine owns
@@ -51,6 +51,10 @@ from config import (
     BREAKEVEN_ENABLED,
     TRAIL_TV_BAR_PATH,
     TRAIL_TV_ENTRY_CANDLE_LIVE,
+    PINE_PROFILE,
+    PINE_TRAIL_PRICE_SOURCE,
+    TRAIL_TRACE,
+    PINE_REALTIME_VAR_ROLLBACK,
 )
 from risk.calculator import RiskLevels, TrailState
 
@@ -238,6 +242,11 @@ class TrailMonitor:
         self._task             : Optional[asyncio.Task] = None
         self._exit_fired       : bool = False
 
+        # Pine realtime rollback: `trailStage` is declared with `var`, not `varip`.
+        # Intrabar assignments therefore roll back to the previous confirmed bar's
+        # value before the next tick. `_committed_stage` stores that confirmed value.
+        self._committed_stage   : int = 0
+
         # Pine v6 parity: ATR is dynamic on the realtime bar because the supplied
         # strategy uses calc_on_every_tick=true and ta.atr(ATR_LEN).  Keep the
         # previous CONFIRMED-bar ATR as the Wilder-RMA baseline, then recompute
@@ -363,8 +372,9 @@ class TrailMonitor:
         self._gap_fill_next_tick = False
 
         # Pine trail runtime state — reset on every new trade
-        trail_state.trail_armed = False 
+        trail_state.trail_armed = False
         trail_state.best_price  = 0.0
+        self._committed_stage   = int(trail_state.stage)
         # current_sl already set to risk.sl by main.py (correct initial SL)
 
         self._entry_wall_ms = entry_wall_ms if entry_wall_ms is not None else int(time.time() * 1000)
@@ -417,6 +427,8 @@ class TrailMonitor:
             f"breakeven_enabled={BREAKEVEN_ENABLED}  "
             f"tv_bar_path={TRAIL_TV_BAR_PATH}  "
             f"tv_entry_candle_live={TRAIL_TV_ENTRY_CANDLE_LIVE}  "
+            f"pine_profile={PINE_PROFILE} trail_source={PINE_TRAIL_PRICE_SOURCE}  "
+            f"rollback_stage={PINE_REALTIME_VAR_ROLLBACK}  "
             f"stage0_native_trail={TRAIL_LEGACY_TV_TICK_SEMANTICS}  "
             f"activation_pts={_trail_pts(1, risk_levels.atr):.2f}  "
             f"trail_off={_trail_off(1, risk_levels.atr):.2f}  "
@@ -523,8 +535,23 @@ class TrailMonitor:
         # Strict/live parity defaults to tick mode because the corrected Pine
         # uses calc_on_every_tick=true. Bar-close remains available for testing.
         close_profit = (bar_close - entry_price) if is_long else (entry_price - bar_close)
+
+        # Exact Pine realtime rollback semantics. `trailStage` is an ordinary
+        # `var`, so only the closing-tick value commits into the next bar. Any
+        # higher stage touched earlier intrabar is temporary script state, though
+        # orders created/modified on those ticks are not rolled back by Pine.
+        if PINE_REALTIME_VAR_ROLLBACK:
+            committed_new = _upgrade_stage(self._committed_stage, close_profit, atr)
+            if committed_new != self._committed_stage:
+                logger.info(
+                    f"[TRAIL] Pine stage COMMIT {self._committed_stage} -> {committed_new} | "
+                    f"close={bar_close:.2f} profit={close_profit:.2f} atr={atr:.2f}"
+                )
+            self._committed_stage = committed_new
+            state.stage = committed_new
+
         new_stage = _upgrade_stage(state.stage, close_profit, atr)
-        if TRAIL_STAGE_UPDATE_MODE == "bar_close" and new_stage > state.stage:
+        if (not PINE_REALTIME_VAR_ROLLBACK) and TRAIL_STAGE_UPDATE_MODE == "bar_close" and new_stage > state.stage:
             logger.info(
                 f"[TRAIL] Stage {state.stage} → {new_stage} at bar close |  "
                 f"profit={close_profit:.2f} atr={atr:.2f} "
@@ -659,7 +686,12 @@ class TrailMonitor:
                     does NOT update best_price (prevents offset-drift from
                     corrupting the trail depth vs Pine)
         """
-        if not self._running or self._exit_fired or price  <= 0:
+        if not self._running or self._exit_fired or price <= 0:
+            return
+
+        # A TradingView strategy has one chart price history. Never splice a
+        # second venue into best_price / ATR / trail-stop decisions.
+        if source in {"binance", "delta"} and source != PINE_TRAIL_PRICE_SOURCE:
             return
 
         if source == "binance" and self._risk is not None:
@@ -722,6 +754,8 @@ class TrailMonitor:
         is unchanged apart from deterministic ordering.
         """
         if not self._running or self._exit_fired or price <= 0:
+            return
+        if PINE_TRAIL_PRICE_SOURCE != "delta":
             return
 
         async with self._delta_tick_lock:
@@ -870,6 +904,11 @@ class TrailMonitor:
                         logger.warning(f"[TRAIL] FIX-10: Position poll failed (keeping trail): {poll_err}")
                 # ── END POSITION GUARD ────────────────────────────────────────
 
+                # Delta REST cannot be used as a fallback when Pine parity is
+                # driven by Binance; that would synthesize a price path Pine never saw.
+                if PINE_TRAIL_PRICE_SOURCE != "delta":
+                    continue
+
                 # ALL-TRADES-FIX: skip the REST ticker while the Delta all_trades
                 # stream is fresh; a REST price can be older than the last real trade.
                 if time.time() - getattr(self, "_last_ws_trade_wall_s", 0.0) < 3.0:
@@ -1014,9 +1053,21 @@ class TrailMonitor:
         self._refresh_dynamic_orders()
         atr = self._current_atr
 
-        # SNIPER v6 gap fill: only a real Delta price consumes the flag.
+        if TRAIL_TRACE:
+            order_stage = state.stage if state.stage > 0 else (1 if TRAIL_LEGACY_TV_TICK_SEMANTICS else 0)
+            act = _activation_price(entry_price, order_stage, atr, is_long) if order_stage > 0 else 0.0
+            off = _trail_off(order_stage, atr) if order_stage > 0 else 0.0
+            logger.info(
+                f"[TRAIL-TRACE] src={source} px={price:.2f} atr={atr:.4f} "
+                f"committed_stage={self._committed_stage} stage={state.stage} "
+                f"order_stage={order_stage} armed={state.trail_armed} "
+                f"best={state.best_price:.2f} sl={state.current_sl:.2f} "
+                f"act={act:.2f} off={off:.2f}"
+            )
+
+        # Gap-fill handling follows the single authoritative Pine price source.
         gap_fill = False
-        if self._gap_fill_next_tick and source == "delta":
+        if self._gap_fill_next_tick and source == PINE_TRAIL_PRICE_SOURCE:
             gap_fill = True
             self._gap_fill_next_tick = False
 
@@ -1031,17 +1082,25 @@ class TrailMonitor:
             profit_dist = (price - entry_price) if is_long else (entry_price - price)
 
             if TRAIL_STAGE_UPDATE_MODE == "tick":
-                new_stage = _upgrade_stage(state.stage, profit_dist, atr)
-                if new_stage > state.stage:
+                stage_base = self._committed_stage if PINE_REALTIME_VAR_ROLLBACK else state.stage
+                new_stage = _upgrade_stage(stage_base, profit_dist, atr)
+
+                # With Pine rollback enabled, stage may appear to move down again
+                # on a later tick because every execution starts from the previous
+                # bar's committed value. The native stop itself is not rolled back;
+                # `_apply_trail_sl` remains tighten-only for that reason.
+                stage_changed = (new_stage != state.stage) if PINE_REALTIME_VAR_ROLLBACK else (new_stage > state.stage)
+                if stage_changed:
                     old_stage = state.stage
                     state.stage = new_stage
                     logger.info(
-                        f"[TRAIL] Stage {old_stage} → {new_stage} LIVE | "
-                        f"price={price:.2f} profit={profit_dist:.2f} atr={atr:.2f}"
+                        f"[TRAIL] Pine realtime stage {old_stage} -> {new_stage} | "
+                        f"base={stage_base} price={price:.2f} profit={profit_dist:.2f} atr={atr:.2f}"
                     )
                     if getattr(state, "trail_armed", False) and state.best_price > 0:
-                        new_sl = _trail_sl_from_best(state.best_price, state.stage, atr, is_long)
-                        self._apply_trail_sl(state, risk, new_sl, is_long, source="stage_upgrade_tick")
+                        order_stage = state.stage if state.stage > 0 else 1
+                        new_sl = _trail_sl_from_best(state.best_price, order_stage, atr, is_long)
+                        self._apply_trail_sl(state, risk, new_sl, is_long, source="stage_tick")
 
             if BREAKEVEN_ENABLED and BREAKEVEN_UPDATE_MODE == "tick" and (not state.be_done) and profit_dist > atr * BE_MULT:
                 self._activate_be(state, risk, is_long, atr, source="live_tick")
@@ -1461,6 +1520,9 @@ class TrailMonitor:
         if not self._running or self._exit_fired or self._state is None or self._risk is None:
             return
 
+        if source in {"binance", "delta"} and source != PINE_TRAIL_PRICE_SOURCE:
+            return
+
         is_long = self._risk.is_long
 
         if source == "binance":
@@ -1546,8 +1608,13 @@ class TrailMonitor:
 
         TP and Max SL do NOT call this — they fire instantly regardless.
         """
-        breached = (price  <= sl_level) if is_long else (price  >= sl_level)
-        now_ms   = int(time.time() * 1000)
+        breached = (price <= sl_level) if is_long else (price >= sl_level)
+        now_ms = int(time.time() * 1000)
+
+        # Native Pine stop orders do not wait for Python-side debounce/confirm
+        # windows. In strict parity mode, the first authoritative crossing wins.
+        if PINE_PARITY_MODE:
+            return breached
 
         # ── MODE A: Tick-count confirm (Option 1 + 3) ─────────────────────────
         if SL_CONFIRM_TICKS  > 0:

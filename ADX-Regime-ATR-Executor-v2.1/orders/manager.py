@@ -45,6 +45,7 @@ from config import (
     SYMBOL, ALERT_QTY, BOT_NAME, EXECUTION_MODE, LIVE_TRADING_ENABLED,
     EMERGENCY_BRACKET_ENABLED, MAX_EXIT_SLIPPAGE_ATR_PCT,
     DELTA_CONTRACT_VALUE, DELTA_PRODUCT_SYMBOL, PINE_MINTICK, BINANCE_SIGNAL_FEED, STRICT_MARKET_METADATA,
+    TP_HARD_EXIT, TREND_HARD_TP_ENABLED, RANGE_HARD_TP_ENABLED,  # EXITFIX
 )
 
 logger = logging.getLogger("orders.manager")
@@ -352,6 +353,7 @@ class OrderManager:
         tp: float,
         atr: float = 1.0,
         stop_dist: Optional[float] = None,
+        is_trend: Optional[bool] = None,  # EXITFIX
     ) -> dict:
         """
         Place a market entry, then attach an exchange-side initial SL + TP.
@@ -418,7 +420,10 @@ class OrderManager:
             exact_sl = sl + fill_shift
             exact_tp = tp + fill_shift
 
-            await self._place_bracket(sl=exact_sl, tp=exact_tp)
+            _hard_tp = TP_HARD_EXIT and (
+                RANGE_HARD_TP_ENABLED if is_trend is False else TREND_HARD_TP_ENABLED
+            )  # EXITFIX: no exchange TP leg when hard TP is disabled for this regime
+            await self._place_bracket(sl=exact_sl, tp=exact_tp if _hard_tp else None)
             self._current_sl = exact_sl
             self._current_tp = exact_tp
             self._bracket_active = True
@@ -436,7 +441,7 @@ class OrderManager:
         return order
 
     # ── Bracket management ─────────────────────────────────────────────────────
-    async def _place_bracket(self, sl: float, tp: float) -> dict:
+    async def _place_bracket(self, sl: float, tp: Optional[float]) -> dict:  # EXITFIX
         """POST /v2/orders/bracket with market SL and market TP triggers.
 
         Delta's schema requires exactly one product selector. We use product_id
@@ -454,6 +459,8 @@ class OrderManager:
             },
             "bracket_stop_trigger_method": "last_traded_price",
         }
+        if tp is None:  # EXITFIX: SL-only crash bracket
+            body.pop("take_profit_order", None)
         session = await self._http_session()
         result = await _signed_request(session, "POST", "/v2/orders/bracket", body)
 

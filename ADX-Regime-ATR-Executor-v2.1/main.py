@@ -47,6 +47,7 @@ from config import (
     TELEGRAM_ENABLED, BOT_NAME,
     SYMBOL, ALERT_QTY, CANDLE_TIMEFRAME, FILTER_VOL_ENABLED,
     POSITION_BTC_SIZE, TREND_ATR_MULT, RANGE_ATR_MULT, BINANCE_SIGNAL_FEED,
+    ENABLE_RANGE_TRADES,  # EXITFIX
 )
 from feed.ws_feed            import CandleFeed
 from feed.binance_price_feed import BinancePriceFeed
@@ -428,6 +429,9 @@ class ADXRegimeATRExecutor:
             return
 
         logger.info(f"[SIGNAL] {sig.signal_type.value}  is_long={sig.is_long}  regime={sig.regime}")
+        if (not sig.is_trend) and (not ENABLE_RANGE_TRADES):  # EXITFIX
+            logger.info("[SIGNAL] range signal skipped (ENABLE_RANGE_TRADES=false)")
+            return
 
         # ── 4. Place entry ─────────────────────────────────────────────────────
         if self._entry_lock.locked():
@@ -446,6 +450,7 @@ class ADXRegimeATRExecutor:
                     tp        = risk_pre.tp,
                     atr       = snap.atr,
                     stop_dist = risk_pre.stop_dist,
+                    is_trend  = sig.is_trend,  # EXITFIX
                 )
             except Exception as e:
                 logger.error(f"[ENTRY] Order failed: {e}")
